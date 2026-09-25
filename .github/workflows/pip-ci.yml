@@ -45,8 +45,9 @@ jobs:
           node - <<'NODE'
           const fs = require('fs');
           const html = fs.readFileSync('static/pip.html', 'utf8');
-          const match = html.match(/<script>([\\s\\S]*?)<\\/script>/i);
-          if (!match) throw new Error('dashboard script not found');
-          new Function(match[1]);
+          const start = html.indexOf('<script>');
+          const end = html.indexOf('</script>', start + 8);
+          if (start < 0 || end < 0) throw new Error('dashboard script not found');
+          new Function(html.slice(start + 8, end));
           console.log('dashboard JavaScript parses');
           NODE
