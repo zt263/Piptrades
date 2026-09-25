@@ -215,6 +215,7 @@ class PipKalshiClient:
         yes_price: Decimal,
         post_only: bool = False,
         time_in_force: str = "good_till_canceled",
+        reduce_only: bool = False,
     ):
         if book_side not in {"bid", "ask"}:
             raise PipKalshiError("book_side must be bid or ask")
@@ -230,6 +231,7 @@ class PipKalshiClient:
             "price": format(yes_price.quantize(Decimal("0.01")), "f"),
             "time_in_force": time_in_force,
             "post_only": bool(post_only),
+            "reduce_only": bool(reduce_only),
             "cancel_order_on_pause": True,
             "self_trade_prevention_type": "taker_at_cross",
         }
