@@ -381,11 +381,18 @@ class PipStore:
                     break
             return count
 
-    async def record_equity(self, equity: float, cash: float, exposure: float, realized: float, unrealized: float):
+    async def record_equity(
+        self,
+        equity: float,
+        cash: float,
+        exposure: float,
+        realized_pnl: float,
+        unrealized_pnl: float,
+    ):
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
                 "INSERT INTO pip_equity(recorded_at,equity,cash,exposure,realized_pnl,unrealized_pnl) VALUES(?,?,?,?,?,?)",
-                (utcnow(), equity, cash, exposure, realized, unrealized),
+                (utcnow(), equity, cash, exposure, realized_pnl, unrealized_pnl),
             )
             await db.commit()
 
