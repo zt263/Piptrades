@@ -40,14 +40,30 @@ jobs:
         run: python -m py_compile src/pip/*.py pip_app.py
       - name: Test
         run: PYTHONPATH=. pytest -q tests/test_pip.py
-      - name: Validate dashboard JavaScript
+      - name: Validate dashboard structure and JavaScript
         run: |
           node - <<'NODE'
           const fs = require('fs');
           const html = fs.readFileSync('static/pip.html', 'utf8');
+          const count = (needle) => html.split(needle).length - 1;
+          if (count('<script>') !== 1) throw new Error('dashboard must contain exactly one <script>');
+          if (count('</script>') !== 1) throw new Error('dashboard must contain exactly one </script>');
+          if (count('</html>') !== 1) throw new Error('dashboard must contain exactly one </html>');
+          const htmlEnd = html.lastIndexOf('</html>');
+          if (html.slice(htmlEnd + 7).trim()) throw new Error('content found after </html>');
           const start = html.indexOf('<script>');
           const end = html.indexOf('</script>', start + 8);
-          if (start < 0 || end < 0) throw new Error('dashboard script not found');
-          new Function(html.slice(start + 8, end));
-          console.log('dashboard JavaScript parses');
+          const js = html.slice(start + 8, end);
+          new Function(js);
+          for (const required of [
+            'id="opportunityRows"',
+            'id="positionRows"',
+            'function renderOpportunities',
+            'async function refresh',
+            'Best opportunities',
+            'Pip activity'
+          ]) {
+            if (!html.includes(required)) throw new Error('dashboard missing: ' + required);
+          }
+          console.log('dashboard structure and JavaScript are valid');
           NODE
