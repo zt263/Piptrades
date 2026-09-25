@@ -137,7 +137,17 @@ class PipWebApp:
         return web.json_response(config.to_public_dict())
 
     async def health(self, request):
-        return web.json_response({"ok": True, "service": "piptrades"})
+        return web.json_response({
+            "ok": True,
+            "service": "piptrades",
+            "commit": os.getenv("RAILWAY_GIT_COMMIT_SHA") or os.getenv("RAILWAY_GIT_COMMIT") or "unknown",
+            "scanning": self.engine.scanning,
+            "last_scan_at": self.engine.last_scan_at,
+            "last_scan_error": self.engine.last_scan_error,
+            "scan_stats": self.engine.last_scan_stats,
+            "kalshi_environment": self.kalshi.environment.name,
+            "kalshi_authenticated": self.kalshi.authenticated,
+        })
 
     async def on_startup(self, app):
         await self.store.initialize()
