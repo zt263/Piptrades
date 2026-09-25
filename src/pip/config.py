@@ -36,7 +36,7 @@ class PipConfig:
     late_close_target_cents: int = 1
     late_close_stop_cents: int = 1
     late_close_max_hold_minutes: int = 30
-    late_close_size_multiplier: float = 0.50
+    late_close_size_multiplier: float = 1.00
 
     min_volume_24h: float = 25.0
     max_spread_cents: int = 2
