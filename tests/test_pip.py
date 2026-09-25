@@ -66,3 +66,9 @@ def test_online_model_moves_toward_observed_outcome():
     after = model.predict(features)
     assert after > before
     assert model.observations == 1
+
+
+def test_live_autotrading_stays_locked_without_server_gate(monkeypatch):
+    monkeypatch.delenv("PIP_LIVE_EXECUTION_ENABLED", raising=False)
+    cfg = PipConfig(mode="live").normalize()
+    assert cfg.can_submit_real_money() is False
