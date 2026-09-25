@@ -6,6 +6,7 @@ on:
     paths:
       - "src/pip/**"
       - "pip_app.py"
+      - "static/pip.html"
       - "tests/test_pip.py"
       - "requirements-pip.txt"
       - "Dockerfile"
@@ -15,6 +16,7 @@ on:
     paths:
       - "src/pip/**"
       - "pip_app.py"
+      - "static/pip.html"
       - "tests/test_pip.py"
       - "requirements-pip.txt"
       - "Dockerfile"
@@ -38,3 +40,13 @@ jobs:
         run: python -m py_compile src/pip/*.py pip_app.py
       - name: Test
         run: PYTHONPATH=. pytest -q tests/test_pip.py
+      - name: Validate dashboard JavaScript
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const html = fs.readFileSync('static/pip.html', 'utf8');
+          const match = html.match(/<script>([\\s\\S]*?)<\\/script>/i);
+          if (!match) throw new Error('dashboard script not found');
+          new Function(match[1]);
+          console.log('dashboard JavaScript parses');
+          NODE
