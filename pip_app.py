@@ -36,7 +36,16 @@ class PipWebApp:
         return await handler(request)
 
     async def index(self, request):
-        return web.FileResponse(DASHBOARD)
+        response = web.FileResponse(DASHBOARD)
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        response.headers["X-Pip-Commit"] = (
+            os.getenv("RAILWAY_GIT_COMMIT_SHA")
+            or os.getenv("RAILWAY_GIT_COMMIT")
+            or "unknown"
+        )
+        return response
 
     async def api_status(self, request):
         return web.json_response(await self.engine.status())
