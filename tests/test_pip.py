@@ -72,3 +72,19 @@ def test_live_autotrading_stays_locked_without_server_gate(monkeypatch):
     monkeypatch.delenv("PIP_LIVE_EXECUTION_ENABLED", raising=False)
     cfg = PipConfig(mode="live").normalize()
     assert cfg.can_submit_real_money() is False
+
+
+def test_activity_dial_widens_universe_without_changing_size():
+    low = PipConfig(trade_activity=0, risk_level=100).normalize()
+    high = PipConfig(trade_activity=100, risk_level=100).normalize()
+
+    assert low.effective_position_pct == high.effective_position_pct == 0.10
+    assert low.effective_order_pct == high.effective_order_pct == 0.10
+
+    assert high.effective_min_contract_price < low.effective_min_contract_price
+    assert high.effective_max_spread_cents > low.effective_max_spread_cents
+    assert high.effective_min_volume_24h < low.effective_min_volume_24h
+    assert high.effective_shortlist_size > low.effective_shortlist_size
+    assert high.min_signal_probability < low.min_signal_probability
+    assert high.min_expected_value_dollars > 0
+    assert high.max_new_trades_per_scan > low.max_new_trades_per_scan
