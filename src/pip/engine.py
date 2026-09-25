@@ -96,14 +96,16 @@ def quotes_for_market(market: dict[str, Any]) -> list[SideQuote]:
         volume_24h=vol,
         close_time=close_time,
     )
+    # Kalshi market payloads expose YES-side sizes. NO bid liquidity is the
+    # complementary YES ask liquidity; NO ask liquidity is complementary YES bid.
     no = SideQuote(
         ticker=ticker,
         title=title,
         side="no",
         bid=price_field(market, "no_bid"),
         ask=price_field(market, "no_ask"),
-        bid_size=size_field(market, "no_bid_size"),
-        ask_size=size_field(market, "no_ask_size"),
+        bid_size=size_field(market, "yes_ask_size"),
+        ask_size=size_field(market, "yes_bid_size"),
         volume_24h=vol,
         close_time=close_time,
     )
@@ -130,6 +132,38 @@ def _book_levels(orderbook_response: dict[str, Any]) -> tuple[list[tuple[Decimal
         return out
 
     return clean(yes_raw), clean(no_raw)
+
+
+def refresh_quote_from_orderbook(quote: SideQuote, orderbook_response: dict[str, Any]) -> SideQuote:
+    """Replace top-of-book prices/sizes with the authenticated live orderbook."""
+    yes_levels, no_levels = _book_levels(orderbook_response)
+    yes_levels.sort(key=lambda x: x[0], reverse=True)
+    no_levels.sort(key=lambda x: x[0], reverse=True)
+    yes_bid = yes_levels[0] if yes_levels else None
+    no_bid = no_levels[0] if no_levels else None
+
+    if quote.side == "yes":
+        bid = yes_bid[0] if yes_bid else quote.bid
+        ask = (Decimal("1") - no_bid[0]) if no_bid else quote.ask
+        bid_size = yes_bid[1] if yes_bid else quote.bid_size
+        ask_size = no_bid[1] if no_bid else quote.ask_size
+    else:
+        bid = no_bid[0] if no_bid else quote.bid
+        ask = (Decimal("1") - yes_bid[0]) if yes_bid else quote.ask
+        bid_size = no_bid[1] if no_bid else quote.bid_size
+        ask_size = yes_bid[1] if yes_bid else quote.ask_size
+
+    return SideQuote(
+        ticker=quote.ticker,
+        title=quote.title,
+        side=quote.side,
+        bid=bid,
+        ask=ask,
+        bid_size=bid_size,
+        ask_size=ask_size,
+        volume_24h=quote.volume_24h,
+        close_time=quote.close_time,
+    )
 
 
 def side_depths(side: str, quote: SideQuote, orderbook_response: dict[str, Any]) -> tuple[list[float], list[float]]:
@@ -263,7 +297,6 @@ class PipEngine:
                     markets.append(market)
                     for q in quotes_for_market(market):
                         quote_map[(q.ticker, q.side)] = q
-                        self.history[(q.ticker, q.side)].append((time.time(), q.bid))
 
                 await self._reconcile_positions(config, quote_map)
                 await self._resolve_signals(config, model, quote_map)
@@ -284,17 +317,34 @@ class PipEngine:
                 passed_prefilter = len(prelim)
                 prelim = prelim[: config.effective_shortlist_size]
 
-                books: dict[str, dict[str, Any]] = {}
+                # Authenticate one bulk depth request (max 100 tickers) instead of
+                # hammering the exchange with one orderbook request per candidate.
+                depth_candidates = prelim[:100]
+                depth_tickers = list(dict.fromkeys(q.ticker for q in depth_candidates))
+                orderbook_error = None
+                try:
+                    books = await self.kalshi.get_orderbooks(depth_tickers) if depth_tickers else {}
+                except Exception as exc:
+                    books = {}
+                    orderbook_error = str(exc)
+                    await self.store.event("orderbook_error", orderbook_error, "error")
+
                 opportunities = []
-                for q in prelim:
-                    if q.ticker not in books:
-                        try:
-                            books[q.ticker] = await self.kalshi.get_orderbook(q.ticker, depth=20)
-                        except Exception:
-                            books[q.ticker] = {}
-                    opp = self._build_opportunity(q, books[q.ticker], config, model, snapshot)
+                refreshed_quotes: dict[tuple[str, str], SideQuote] = {}
+                for q in depth_candidates:
+                    book = books.get(q.ticker, {})
+                    live_q = refresh_quote_from_orderbook(q, book) if book else q
+                    refreshed_quotes[(live_q.ticker, live_q.side)] = live_q
+                    # Re-apply gates after the live book refresh; a candidate may have moved.
+                    if self._pre_filter_reason(live_q, config) is not None:
+                        continue
+                    self.history[(live_q.ticker, live_q.side)].append((time.time(), live_q.bid))
+                    opp = self._build_opportunity(live_q, book, config, model, snapshot)
                     if opp:
                         opportunities.append(opp)
+
+                # Prefer the authenticated top-of-book for position management/signals.
+                quote_map.update(refreshed_quotes)
 
                 opportunities.sort(key=lambda x: x["score"], reverse=True)
                 await self.store.replace_opportunities(opportunities)
@@ -309,6 +359,9 @@ class PipEngine:
                     "quotes": len(quote_map),
                     "passed_prefilter": passed_prefilter,
                     "shortlisted": len(prelim),
+                    "depth_checked": len(depth_tickers),
+                    "orderbooks_received": len(books),
+                    "orderbook_error": orderbook_error,
                     "ranked": len(opportunities),
                     "eligible": len(eligible),
                     "rejected": dict(rejected),
@@ -335,6 +388,7 @@ class PipEngine:
                     f"Scanned {len(markets)} markets; {len(opportunities)} ranked; {len(eligible)} eligible",
                     payload=self.last_scan_stats,
                 )
+                print(json.dumps({"event": "pip_scan", **self.last_scan_stats}), flush=True)
                 return opportunities
             finally:
                 self.scanning = False
