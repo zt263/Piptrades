@@ -156,6 +156,7 @@ class PipEngine:
         self.scanning = False
         self._loop_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        self._execution_lock = asyncio.Lock()
 
     async def start_background(self):
         if self._loop_task and not self._loop_task.done():
@@ -541,9 +542,17 @@ class PipEngine:
         }
 
     async def submit_reviewed_live_entry(self, ticker: str, side: str) -> dict[str, Any]:
+        if self._execution_lock.locked():
+            raise PipKalshiError("Another reviewed order is being processed")
+        async with self._execution_lock:
+            return await self._submit_reviewed_live_entry_locked(ticker, side)
+
+    async def _submit_reviewed_live_entry_locked(self, ticker: str, side: str) -> dict[str, Any]:
         config = await self.store.load_config()
         if config.mode != "live":
             raise PipKalshiError("Switch Pip to Live mode before approving a real order")
+        if not config.agent_enabled:
+            raise PipKalshiError("Pip is paused; start Pip before approving a new live entry")
         if self.kalshi.environment.name != "production":
             raise PipKalshiError("Reviewed live orders require KALSHI_ENV=production")
         if not self.kalshi.authenticated:
@@ -590,6 +599,12 @@ class PipEngine:
         return {"submitted": bool(submitted), "opportunity": opp}
 
     async def submit_reviewed_live_exit(self, position_id: int) -> dict[str, Any]:
+        if self._execution_lock.locked():
+            raise PipKalshiError("Another reviewed order is being processed")
+        async with self._execution_lock:
+            return await self._submit_reviewed_live_exit_locked(position_id)
+
+    async def _submit_reviewed_live_exit_locked(self, position_id: int) -> dict[str, Any]:
         config = await self.store.load_config()
         if config.mode != "live":
             raise PipKalshiError("Switch Pip to Live mode before approving a real exit")
