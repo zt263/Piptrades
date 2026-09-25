@@ -175,12 +175,12 @@ class PipEngine:
         await self.store.event("agent", "Pip trading loop started")
         while not self.stop_event.is_set():
             config = await self.store.load_config()
-            if config.agent_enabled:
-                try:
-                    await self.scan_once()
-                except Exception as exc:
-                    self.last_scan_error = str(exc)
-                    await self.store.event("scan_error", str(exc), "error")
+            # Keep scanning and managing existing positions even while new entries are paused.
+            try:
+                await self.scan_once()
+            except Exception as exc:
+                self.last_scan_error = str(exc)
+                await self.store.event("scan_error", str(exc), "error")
             try:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=config.scan_interval_seconds)
             except asyncio.TimeoutError:
@@ -372,7 +372,15 @@ class PipEngine:
         )
         if count < 1 or target <= intended:
             return None
-        econ = trade_economics(count, intended, target, stop, entry_is_maker=entry_is_maker)
+        if sum(support) > 0 and sum(support) < count:
+            return None
+        if not entry_is_maker and q.ask_size > 0 and q.ask_size < count:
+            return None
+        econ = trade_economics(
+            count, intended, target, stop,
+            entry_is_maker=entry_is_maker,
+            target_exit_is_maker=False,
+        )
         ev = expected_value(probability, econ)
         fill_factor = 0.70 if entry_is_maker else 1.0
         velocity = max(0.1, float(ev)) * fill_factor / max(5.0, config.signal_horizon_minutes)
@@ -589,9 +597,9 @@ class PipEngine:
     async def _submit_exit(self, p: dict[str, Any], bid: Decimal, reason: str):
         qty = int(p["quantity"])
         if p["mode"] == "paper":
-            maker = reason == "target"
-            exit_price = D(p["target_price"]) if maker else bid
-            fee = conservative_maker_fee(qty, exit_price) if maker else kalshi_fee(qty, exit_price)
+            # Conservative simulator: target and risk exits both cross the executable bid.
+            exit_price = bid
+            fee = kalshi_fee(qty, exit_price)
             pnl = await self.store.close_position(p, exit_price=float(exit_price), exit_fee=float(fee), exit_reason=reason)
             await self.store.event("exit", f"Paper exit {p['ticker']} {reason}: {pnl:+.2f}", payload={"pnl": pnl})
             return
@@ -599,12 +607,12 @@ class PipEngine:
         if p["mode"] == "live" and not config.can_submit_real_money():
             await self.store.event("live_locked", "Live exit blocked by environment gate", "error")
             return
-        exit_contract_price = D(p["target_price"]) if reason == "target" else bid
+        exit_contract_price = bid
         book_side, yes_price = side_to_v2_exit(p["side"], exit_contract_price)
         try:
             response = await self.kalshi.create_order_v2(
                 ticker=p["ticker"], client_order_id=str(uuid.uuid4()), book_side=book_side,
-                count=qty, yes_price=yes_price, post_only=(reason == "target"),
+                count=qty, yes_price=yes_price, post_only=False,
             )
         except Exception as exc:
             await self.store.event("exit_error", f"Exit submission failed {p['ticker']}: {exc}", "error")
@@ -654,6 +662,20 @@ class PipEngine:
                 changed = True
         if changed:
             await self.store.save_model(model)
+
+    async def cancel_pending_entries(self):
+        """Cancel unfilled entry orders while leaving open positions under management."""
+        for p in await self.store.positions():
+            if p["status"] != "pending_entry":
+                continue
+            if p["mode"] != "paper" and p.get("entry_order_id") and self.kalshi.authenticated:
+                try:
+                    await self.kalshi.cancel_order_v2(p["entry_order_id"], p["ticker"])
+                except Exception as exc:
+                    await self.store.event("cancel_error", f"Could not cancel {p['ticker']}: {exc}", "warning")
+                    continue
+            await self.store.update_position(p["id"], status="cancelled")
+            await self.store.event("cancel", f"Cancelled pending entry {p['ticker']} {p['side'].upper()}")
 
     async def _risk_kill_check(self, config: PipConfig, snapshot: dict[str, float]) -> bool:
         equity = max(0.0, snapshot["equity"])
