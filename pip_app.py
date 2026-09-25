@@ -20,6 +20,8 @@ class PipWebApp:
         self.kalshi = PipKalshiClient()
         self.engine = PipEngine(self.store, self.kalshi)
         self.dashboard_token = os.getenv("PIP_DASHBOARD_TOKEN", "")
+        if os.getenv("RAILWAY_ENVIRONMENT") and not self.dashboard_token:
+            raise RuntimeError("PIP_DASHBOARD_TOKEN is required on Railway")
 
     def authorized(self, request: web.Request) -> bool:
         if not self.dashboard_token:
@@ -76,6 +78,7 @@ class PipWebApp:
     async def api_start(self, request):
         config = await self.store.load_config()
         config.agent_enabled = True
+        config.auto_trade = not (config.mode == "live" and not config.live_execution_unlocked)
         await self.store.save_config(config)
         await self.store.event("operator", "Pip started by operator")
         return web.json_response(config.to_public_dict())
@@ -84,7 +87,8 @@ class PipWebApp:
         config = await self.store.load_config()
         config.agent_enabled = False
         await self.store.save_config(config)
-        await self.store.event("operator", "Pip paused by operator", "warning")
+        await self.engine.cancel_pending_entries()
+        await self.store.event("operator", "Pip paused by operator; existing positions still managed", "warning")
         return web.json_response(config.to_public_dict())
 
     async def api_kill(self, request):
@@ -92,7 +96,8 @@ class PipWebApp:
         config.agent_enabled = False
         config.auto_trade = False
         await self.store.save_config(config)
-        await self.store.event("operator", "EMERGENCY KILL: new trading disabled", "error")
+        await self.engine.cancel_pending_entries()
+        await self.store.event("operator", "EMERGENCY KILL: new trading disabled; existing positions still managed", "error")
         return web.json_response(config.to_public_dict())
 
     async def health(self, request):
