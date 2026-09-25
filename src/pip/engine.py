@@ -450,7 +450,7 @@ class PipEngine:
                 entered += 1
                 open_keys.add((opp["ticker"], opp["side"]))
 
-    async def _submit_entry(self, config: PipConfig, opp: dict[str, Any]) -> bool:
+    async def _submit_entry(self, config: PipConfig, opp: dict[str, Any], reviewed: bool = False) -> bool:
         maker = bool(opp["entry_is_maker"])
         rationale = json.dumps({
             "probability": opp["probability"],
@@ -482,8 +482,8 @@ class PipEngine:
                 return True
             return False
 
-        if config.mode == "live" and not config.can_submit_real_money():
-            await self.store.event("live_locked", "Live order blocked: PIP_LIVE_EXECUTION_ENABLED is false", "warning")
+        if config.mode == "live" and not config.can_submit_real_money() and not reviewed:
+            await self.store.event("live_locked", "Live order blocked: explicit review required", "warning")
             return False
         expected_env = "production" if config.mode == "live" else "demo"
         if self.kalshi.environment.name != expected_env:
@@ -496,12 +496,20 @@ class PipEngine:
         response = await self.kalshi.create_order_v2(
             ticker=opp["ticker"], client_order_id=str(uuid.uuid4()), book_side=book_side,
             count=opp["quantity"], yes_price=yes_price, post_only=maker,
+            time_in_force=("fill_or_kill" if reviewed and not maker else "good_till_canceled"),
         )
         order = response.get("order", response)
         order_id = order.get("order_id")
         fill_count = int(float(order.get("fill_count") or 0))
         avg_yes = order.get("average_fill_price")
         actual_contract_price = self._contract_price_from_yes(opp["side"], avg_yes) if avg_yes is not None else None
+        if reviewed and not maker and fill_count <= 0:
+            await self.store.event(
+                "reviewed_live_no_fill",
+                f"Reviewed live entry did not fill {opp['ticker']} {opp['side'].upper()}",
+                "warning",
+            )
+            return False
         status = "open" if fill_count > 0 else "pending_entry"
         qty = fill_count if fill_count > 0 else opp["quantity"]
         if fill_count > 0 and int(float(order.get("remaining_count") or 0)) > 0 and order_id:
@@ -517,9 +525,99 @@ class PipEngine:
             "rationale": rationale,
         })
         if pid:
-            await self.store.event("entry_order", f"Submitted {config.mode} entry for {opp['ticker']}", payload={"order_id": order_id, **opp})
+            kind = "reviewed_live_entry" if reviewed and config.mode == "live" else "entry_order"
+            await self.store.event(kind, f"Submitted {config.mode} entry for {opp['ticker']}", payload={"order_id": order_id, **opp})
             return True
         return False
+
+    async def account_balance(self) -> dict[str, Any]:
+        if not self.kalshi.authenticated:
+            raise PipKalshiError("Kalshi credentials are not configured")
+        payload = await self.kalshi.get_balance()
+        return {
+            "environment": self.kalshi.environment.name,
+            "cash": self._balance_dollars(payload),
+            "authenticated": True,
+        }
+
+    async def submit_reviewed_live_entry(self, ticker: str, side: str) -> dict[str, Any]:
+        config = await self.store.load_config()
+        if config.mode != "live":
+            raise PipKalshiError("Switch Pip to Live mode before approving a real order")
+        if self.kalshi.environment.name != "production":
+            raise PipKalshiError("Reviewed live orders require KALSHI_ENV=production")
+        if not self.kalshi.authenticated:
+            raise PipKalshiError("Kalshi production credentials are not authenticated")
+
+        opportunities = await self.scan_once()
+        opp = next(
+            (o for o in opportunities if o.get("ticker") == ticker and o.get("side") == side),
+            None,
+        )
+        if not opp:
+            raise PipKalshiError("Opportunity is no longer available after a fresh scan")
+
+        snapshot = await self.equity_snapshot(config)
+        if await self._risk_kill_check(config, snapshot):
+            raise PipKalshiError("Risk controls paused new entries")
+
+        positions = await self.store.positions()
+        if len(positions) >= config.max_open_positions:
+            raise PipKalshiError("Maximum open positions reached")
+        if any(p["ticker"] == ticker and p["side"] == side for p in positions):
+            raise PipKalshiError("Pip already has an active position/order in this market and side")
+        if opp["probability"] < config.min_signal_probability:
+            raise PipKalshiError("Signal fell below the current approval threshold")
+        if opp["expected_value"] <= 0 or opp["expected_value"] < config.min_expected_value_dollars:
+            raise PipKalshiError("Expected value fell below the current approval threshold")
+
+        equity = max(0.01, snapshot["equity"])
+        position_notional = float(opp["entry_price"]) * int(opp["quantity"])
+        pending = sum(
+            float(p["intended_entry"]) * int(p["quantity"])
+            for p in positions if p["status"] == "pending_entry"
+        )
+        if position_notional > equity * PipConfig.HARD_MAX_POSITION_PCT + 1e-9:
+            raise PipKalshiError("Order exceeds the hard 10% position cap")
+        if position_notional > equity * PipConfig.HARD_MAX_ORDER_PCT + 1e-9:
+            raise PipKalshiError("Order exceeds the hard 10% order cap")
+        if snapshot["exposure"] + pending + position_notional > equity * config.max_total_exposure_pct + 1e-9:
+            raise PipKalshiError("Order exceeds total exposure limit")
+        if snapshot["cash"] - position_notional < equity * config.min_cash_reserve_pct - 1e-9:
+            raise PipKalshiError("Order would violate the cash reserve")
+
+        submitted = await self._submit_entry(config, opp, reviewed=True)
+        return {"submitted": bool(submitted), "opportunity": opp}
+
+    async def submit_reviewed_live_exit(self, position_id: int) -> dict[str, Any]:
+        config = await self.store.load_config()
+        if config.mode != "live":
+            raise PipKalshiError("Switch Pip to Live mode before approving a real exit")
+        if self.kalshi.environment.name != "production" or not self.kalshi.authenticated:
+            raise PipKalshiError("Kalshi production authentication is required")
+
+        position = next(
+            (p for p in await self.store.positions() if int(p["id"]) == int(position_id)),
+            None,
+        )
+        if not position or position["status"] != "open":
+            raise PipKalshiError("Open live position not found")
+
+        market = await self.kalshi.get_market(position["ticker"])
+        raw_market = market.get("market", market)
+        quote = next(
+            (q for q in quotes_for_market(raw_market) if q.side == position["side"]),
+            None,
+        )
+        if not quote or quote.bid <= 0:
+            raise PipKalshiError("No executable bid is available for this position")
+
+        rationale = position.get("rationale") or ""
+        reason = "reviewed_manual"
+        if "|exit_ready:" in rationale:
+            reason = rationale.rsplit("|exit_ready:", 1)[-1].split("|", 1)[0]
+        result = await self._submit_exit(position, quote.bid, reason, reviewed=True)
+        return result or {"submitted": False}
 
     def _contract_price_from_yes(self, side: str, yes_price: Any) -> Decimal:
         p = D(yes_price)
@@ -592,9 +690,23 @@ class PipEngine:
             if close and close <= datetime.now(timezone.utc) + timedelta(minutes=5):
                 reason = "market_closing"
         if reason:
+            if p["mode"] == "live":
+                config = await self.store.load_config()
+                if not config.can_submit_real_money():
+                    marker = f"|exit_ready:{reason}"
+                    rationale = p.get("rationale") or ""
+                    if marker not in rationale:
+                        await self.store.update_position(p["id"], rationale=rationale + marker)
+                        await self.store.event(
+                            "exit_review_required",
+                            f"Live exit requires approval: {p['ticker']} ({reason})",
+                            "warning",
+                            payload={"position_id": p["id"], "reason": reason, "bid": float(bid)},
+                        )
+                    return
             await self._submit_exit(p, bid, reason)
 
-    async def _submit_exit(self, p: dict[str, Any], bid: Decimal, reason: str):
+    async def _submit_exit(self, p: dict[str, Any], bid: Decimal, reason: str, reviewed: bool = False):
         qty = int(p["quantity"])
         if p["mode"] == "paper":
             # Conservative simulator: target and risk exits both cross the executable bid.
@@ -604,22 +716,48 @@ class PipEngine:
             await self.store.event("exit", f"Paper exit {p['ticker']} {reason}: {pnl:+.2f}", payload={"pnl": pnl})
             return
         config = await self.store.load_config()
-        if p["mode"] == "live" and not config.can_submit_real_money():
-            await self.store.event("live_locked", "Live exit blocked by environment gate", "error")
-            return
+        if p["mode"] == "live" and not config.can_submit_real_money() and not reviewed:
+            await self.store.event("live_locked", "Live exit blocked: explicit review required", "warning")
+            return {"submitted": False}
         exit_contract_price = bid
         book_side, yes_price = side_to_v2_exit(p["side"], exit_contract_price)
         try:
             response = await self.kalshi.create_order_v2(
                 ticker=p["ticker"], client_order_id=str(uuid.uuid4()), book_side=book_side,
                 count=qty, yes_price=yes_price, post_only=False,
+                time_in_force="fill_or_kill", reduce_only=True,
             )
         except Exception as exc:
             await self.store.event("exit_error", f"Exit submission failed {p['ticker']}: {exc}", "error")
-            return
+            return {"submitted": False, "error": str(exc)}
+
         order = response.get("order", response)
-        oid = order.get("order_id")
-        await self.store.update_position(p["id"], status="pending_exit", exit_order_id=oid, rationale=(p.get("rationale") or "") + f"|exit:{reason}")
+        filled = int(float(order.get("fill_count") or 0))
+        if filled <= 0:
+            await self.store.event(
+                "exit_no_fill",
+                f"Exit did not fill {p['ticker']} ({reason})",
+                "warning",
+                payload={"position_id": p["id"], "reason": reason},
+            )
+            return {"submitted": True, "filled": 0, "order_id": order.get("order_id")}
+
+        avg_yes = order.get("average_fill_price")
+        exit_price = self._contract_price_from_yes(p["side"], avg_yes) if avg_yes is not None else exit_contract_price
+        fee = float(order.get("average_fee_paid") or 0)
+        pnl = await self.store.record_partial_exit(
+            p,
+            filled_quantity=filled,
+            exit_price=float(exit_price),
+            exit_fee=fee,
+            exit_reason=reason,
+        )
+        await self.store.event(
+            "reviewed_live_exit" if reviewed and p["mode"] == "live" else "exit",
+            f"{p['mode']} exit filled {p['ticker']}: {pnl:+.2f}",
+            payload={"pnl": pnl, "filled": filled, "order_id": order.get("order_id")},
+        )
+        return {"submitted": True, "filled": filled, "order_id": order.get("order_id"), "pnl": pnl}
 
     async def _reconcile_pending_exit(self, p: dict[str, Any]):
         if not p.get("exit_order_id") or not self.kalshi.authenticated:
