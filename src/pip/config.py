@@ -94,14 +94,42 @@ class PipConfig:
         return min(self.max_order_pct, self.HARD_MAX_ORDER_PCT) * (self.risk_level / 100.0)
 
     @property
+    def activity_fraction(self) -> float:
+        return self.trade_activity / 100.0
+
+    @property
     def min_signal_probability(self) -> float:
-        # Activity changes selectivity, not size. 0 => 86%, 100 => 68%.
-        return 0.86 - (0.18 * (self.trade_activity / 100.0))
+        # Activity changes selectivity, never size. 0 => 86%, 100 => 64%.
+        return 0.86 - (0.22 * self.activity_fraction)
 
     @property
     def min_expected_value_dollars(self) -> float:
-        # Higher activity tolerates smaller positive edges but never negative EV.
-        return 0.08 - (0.07 * (self.trade_activity / 100.0))
+        # Higher activity tolerates smaller positive edges but never zero/negative EV.
+        return max(0.005, 0.08 - (0.075 * self.activity_fraction))
+
+    @property
+    def effective_min_contract_price(self) -> float:
+        # High activity widens the hunting universe slightly without abandoning the thesis.
+        return max(0.88, self.min_contract_price - (0.02 * self.activity_fraction))
+
+    @property
+    def effective_max_spread_cents(self) -> int:
+        # Strict mode wants tight books; max activity can inspect up to 5c spreads.
+        return min(5, max(self.max_spread_cents, round(self.max_spread_cents + (3 * self.activity_fraction))))
+
+    @property
+    def effective_min_volume_24h(self) -> float:
+        # Let high activity inspect thinner markets, but never require less than 2 contracts.
+        return max(2.0, self.min_volume_24h * (1.0 - (0.90 * self.activity_fraction)))
+
+    @property
+    def effective_shortlist_size(self) -> int:
+        return min(200, max(self.shortlist_size, int(round(self.shortlist_size + (120 * self.activity_fraction)))))
+
+    @property
+    def max_new_trades_per_scan(self) -> int:
+        # Relevant to paper/demo/autonomous modes only; reviewed live still needs a tap.
+        return max(1, min(6, 1 + int(self.trade_activity / 20)))
 
     @property
     def live_execution_unlocked(self) -> bool:
@@ -117,6 +145,11 @@ class PipConfig:
             effective_order_pct=self.effective_order_pct,
             min_signal_probability=self.min_signal_probability,
             min_expected_value_dollars=self.min_expected_value_dollars,
+            effective_min_contract_price=self.effective_min_contract_price,
+            effective_max_spread_cents=self.effective_max_spread_cents,
+            effective_min_volume_24h=self.effective_min_volume_24h,
+            effective_shortlist_size=self.effective_shortlist_size,
+            max_new_trades_per_scan=self.max_new_trades_per_scan,
             live_execution_unlocked=self.live_execution_unlocked,
         )
         return data
