@@ -1,7 +1,6 @@
+import asyncio
 from decimal import Decimal
 from unittest.mock import AsyncMock
-
-import pytest
 
 from src.pip.config import PipConfig
 from src.pip.engine import quotes_for_market, refresh_quote_from_orderbook
@@ -147,42 +146,45 @@ def test_orderbook_refresh_uses_complementary_bids_for_asks():
     assert live_no.ask_size == 11.0
 
 
-@pytest.mark.asyncio
-async def test_market_discovery_excludes_multivariate_markets(monkeypatch):
-    client = PipKalshiClient(env="production")
-    client.request = AsyncMock(return_value={"markets": [], "cursor": ""})
-    await client.get_markets()
-    _, path = client.request.call_args.args
-    kwargs = client.request.call_args.kwargs
-    assert path == "/trade-api/v2/markets"
-    assert kwargs["params"]["mve_filter"] == "exclude"
-    await client.close()
+def test_market_discovery_excludes_multivariate_markets():
+    async def run():
+        client = PipKalshiClient(env="production")
+        client.request = AsyncMock(return_value={"markets": [], "cursor": ""})
+        await client.get_markets()
+        _, path = client.request.call_args.args
+        kwargs = client.request.call_args.kwargs
+        assert path == "/trade-api/v2/markets"
+        assert kwargs["params"]["mve_filter"] == "exclude"
+        await client.close()
+    asyncio.run(run())
 
 
-@pytest.mark.asyncio
-async def test_orderbooks_are_authenticated_and_bulk(monkeypatch):
-    client = PipKalshiClient(env="production")
-    client.api_key = "test"
-    client.private_key = object()
-    client.request = AsyncMock(return_value={
-        "orderbooks": [{"ticker": "A", "orderbook_fp": {"yes_dollars": [], "no_dollars": []}}]
-    })
-    result = await client.get_orderbooks(["A", "B"])
-    assert "A" in result
-    _, path = client.request.call_args.args
-    kwargs = client.request.call_args.kwargs
-    assert path == "/trade-api/v2/markets/orderbooks"
-    assert kwargs["params"]["tickers"] == ["A", "B"]
-    assert kwargs["auth"] is True
-    await client.close()
+def test_orderbooks_are_authenticated_and_bulk():
+    async def run():
+        client = PipKalshiClient(env="production")
+        client.api_key = "test"
+        client.private_key = object()
+        client.request = AsyncMock(return_value={
+            "orderbooks": [{"ticker": "A", "orderbook_fp": {"yes_dollars": [], "no_dollars": []}}]
+        })
+        result = await client.get_orderbooks(["A", "B"])
+        assert "A" in result
+        _, path = client.request.call_args.args
+        kwargs = client.request.call_args.kwargs
+        assert path == "/trade-api/v2/markets/orderbooks"
+        assert kwargs["params"]["tickers"] == ["A", "B"]
+        assert kwargs["auth"] is True
+        await client.close()
+    asyncio.run(run())
 
 
-@pytest.mark.asyncio
-async def test_get_order_uses_current_v2_portfolio_path():
-    client = PipKalshiClient(env="production")
-    client.request = AsyncMock(return_value={"order": {}})
-    await client.get_order("order-123")
-    _, path = client.request.call_args.args
-    assert path == "/trade-api/v2/portfolio/orders/order-123"
-    assert client.request.call_args.kwargs["auth"] is True
-    await client.close()
+def test_get_order_uses_current_v2_portfolio_path():
+    async def run():
+        client = PipKalshiClient(env="production")
+        client.request = AsyncMock(return_value={"order": {}})
+        await client.get_order("order-123")
+        _, path = client.request.call_args.args
+        assert path == "/trade-api/v2/portfolio/orders/order-123"
+        assert client.request.call_args.kwargs["auth"] is True
+        await client.close()
+    asyncio.run(run())
