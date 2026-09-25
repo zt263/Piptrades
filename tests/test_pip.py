@@ -1,6 +1,11 @@
 from decimal import Decimal
+from unittest.mock import AsyncMock
+
+import pytest
 
 from src.pip.config import PipConfig
+from src.pip.engine import quotes_for_market, refresh_quote_from_orderbook
+from src.pip.kalshi import PipKalshiClient
 from src.pip.math import (
     expected_value,
     kalshi_fee,
@@ -88,3 +93,96 @@ def test_activity_dial_widens_universe_without_changing_size():
     assert high.min_signal_probability < low.min_signal_probability
     assert high.min_expected_value_dollars > 0
     assert high.max_new_trades_per_scan > low.max_new_trades_per_scan
+
+
+def test_no_quote_sizes_are_derived_from_yes_liquidity():
+    market = {
+        "ticker": "TEST",
+        "title": "Test market",
+        "yes_bid_dollars": "0.0400",
+        "yes_ask_dollars": "0.0500",
+        "yes_bid_size_fp": "12.00",
+        "yes_ask_size_fp": "34.00",
+        "no_bid_dollars": "0.9500",
+        "no_ask_dollars": "0.9600",
+        "volume_24h_fp": "100.00",
+        "close_time": "2099-01-01T00:00:00Z",
+    }
+    yes, no = quotes_for_market(market)
+    assert yes.bid_size == 12.0
+    assert yes.ask_size == 34.0
+    assert no.bid_size == 34.0
+    assert no.ask_size == 12.0
+
+
+def test_orderbook_refresh_uses_complementary_bids_for_asks():
+    market = {
+        "ticker": "TEST",
+        "title": "Test market",
+        "yes_bid_dollars": "0.9500",
+        "yes_ask_dollars": "0.9700",
+        "yes_bid_size_fp": "5.00",
+        "yes_ask_size_fp": "8.00",
+        "no_bid_dollars": "0.0300",
+        "no_ask_dollars": "0.0500",
+        "volume_24h_fp": "100.00",
+        "close_time": "2099-01-01T00:00:00Z",
+    }
+    yes, no = quotes_for_market(market)
+    book = {
+        "orderbook_fp": {
+            "yes_dollars": [["0.9600", "11.00"]],
+            "no_dollars": [["0.0300", "17.00"]],
+        }
+    }
+    live_yes = refresh_quote_from_orderbook(yes, book)
+    live_no = refresh_quote_from_orderbook(no, book)
+    assert live_yes.bid == Decimal("0.9600")
+    assert live_yes.ask == Decimal("0.9700")
+    assert live_yes.bid_size == 11.0
+    assert live_yes.ask_size == 17.0
+    assert live_no.bid == Decimal("0.0300")
+    assert live_no.ask == Decimal("0.0400")
+    assert live_no.bid_size == 17.0
+    assert live_no.ask_size == 11.0
+
+
+@pytest.mark.asyncio
+async def test_market_discovery_excludes_multivariate_markets(monkeypatch):
+    client = PipKalshiClient(env="production")
+    client.request = AsyncMock(return_value={"markets": [], "cursor": ""})
+    await client.get_markets()
+    _, path = client.request.call_args.args
+    kwargs = client.request.call_args.kwargs
+    assert path == "/trade-api/v2/markets"
+    assert kwargs["params"]["mve_filter"] == "exclude"
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_orderbooks_are_authenticated_and_bulk(monkeypatch):
+    client = PipKalshiClient(env="production")
+    client.api_key = "test"
+    client.private_key = object()
+    client.request = AsyncMock(return_value={
+        "orderbooks": [{"ticker": "A", "orderbook_fp": {"yes_dollars": [], "no_dollars": []}}]
+    })
+    result = await client.get_orderbooks(["A", "B"])
+    assert "A" in result
+    _, path = client.request.call_args.args
+    kwargs = client.request.call_args.kwargs
+    assert path == "/trade-api/v2/markets/orderbooks"
+    assert kwargs["params"]["tickers"] == ["A", "B"]
+    assert kwargs["auth"] is True
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_get_order_uses_current_v2_portfolio_path():
+    client = PipKalshiClient(env="production")
+    client.request = AsyncMock(return_value={"order": {}})
+    await client.get_order("order-123")
+    _, path = client.request.call_args.args
+    assert path == "/trade-api/v2/portfolio/orders/order-123"
+    assert client.request.call_args.kwargs["auth"] is True
+    await client.close()
