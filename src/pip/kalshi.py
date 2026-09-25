@@ -44,11 +44,12 @@ ENVIRONMENTS = {
 
 
 class PipKalshiClient:
-    """Small current Kalshi V2 client dedicated to Pip.
+    """Current Kalshi V2 client dedicated to Pip.
 
-    Public market reads work without credentials. Authenticated portfolio/order calls
-    require a matching API key + private key. Write requests are never automatically
-    retried, avoiding accidental duplicate orders after ambiguous failures.
+    Public market-list reads do not require credentials. Orderbook, portfolio,
+    order, fill, and execution requests are authenticated. GETs may retry;
+    writes never retry automatically to avoid duplicate orders after ambiguous
+    network failures.
     """
 
     def __init__(self, env: str | None = None, timeout: float = 20.0):
@@ -106,7 +107,10 @@ class PipKalshiClient:
         if isinstance(key, rsa.RSAPrivateKey):
             sig = key.sign(
                 payload,
-                padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.DIGEST_LENGTH,
+                ),
                 hashes.SHA256(),
             )
         elif isinstance(key, ed25519.Ed25519PrivateKey):
@@ -137,9 +141,12 @@ class PipKalshiClient:
         method = method.upper()
         if not path.startswith("/trade-api/v2/"):
             raise PipKalshiError(f"Unexpected API path: {path}")
+
         url = self.environment.host + path
         if params:
-            url += "?" + urlencode({k: v for k, v in params.items() if v is not None})
+            clean = {k: v for k, v in params.items() if v is not None}
+            url += "?" + urlencode(clean, doseq=True)
+
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
         if auth:
             headers.update(self._auth_headers(method, path))
@@ -156,25 +163,41 @@ class PipKalshiClient:
                     err = PipKalshiError(f"Kalshi HTTP {resp.status}: {text[:500]}")
                     if method == "GET" and (resp.status == 429 or resp.status >= 500) and attempt + 1 < attempts:
                         last_error = err
-                        await asyncio.sleep(0.4 * (2 ** attempt))
+                        await asyncio.sleep(0.5 * (2 ** attempt))
                         continue
                     raise err
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 last_error = exc
                 if method != "GET" or attempt + 1 >= attempts:
                     raise PipKalshiError(f"Kalshi request failed: {exc}") from exc
-                await asyncio.sleep(0.4 * (2 ** attempt))
+                await asyncio.sleep(0.5 * (2 ** attempt))
         raise PipKalshiError(f"Kalshi request failed: {last_error}")
 
-    async def get_markets(self, *, limit: int = 1000, cursor: str | None = None, status: str = "open"):
+    async def get_markets(
+        self,
+        *,
+        limit: int = 1000,
+        cursor: str | None = None,
+        status: str = "open",
+        mve_filter: str = "exclude",
+        tickers: str | None = None,
+    ):
         return await self.request(
-            "GET", "/trade-api/v2/markets", params={"limit": limit, "cursor": cursor, "status": status}
+            "GET",
+            "/trade-api/v2/markets",
+            params={
+                "limit": limit,
+                "cursor": cursor,
+                "status": status,
+                "mve_filter": mve_filter,
+                "tickers": tickers,
+            },
         )
 
     async def iter_open_markets(self, max_pages: int = 20):
         cursor = None
         for _ in range(max_pages):
-            data = await self.get_markets(cursor=cursor)
+            data = await self.get_markets(cursor=cursor, mve_filter="exclude")
             for market in data.get("markets", []):
                 yield market
             cursor = data.get("cursor")
@@ -186,8 +209,33 @@ class PipKalshiClient:
 
     async def get_orderbook(self, ticker: str, depth: int = 20):
         return await self.request(
-            "GET", f"/trade-api/v2/markets/{ticker}/orderbook", params={"depth": depth}
+            "GET",
+            f"/trade-api/v2/markets/{ticker}/orderbook",
+            params={"depth": depth},
+            auth=True,
         )
+
+    async def get_orderbooks(self, tickers: list[str]) -> dict[str, dict[str, Any]]:
+        unique = list(dict.fromkeys(t for t in tickers if t))
+        if not unique:
+            return {}
+        if not self.authenticated:
+            raise PipKalshiError("Authenticated Kalshi credentials are required for orderbooks")
+
+        out: dict[str, dict[str, Any]] = {}
+        for i in range(0, len(unique), 100):
+            chunk = unique[i:i + 100]
+            data = await self.request(
+                "GET",
+                "/trade-api/v2/markets/orderbooks",
+                params={"tickers": chunk},
+                auth=True,
+            )
+            for item in data.get("orderbooks", []):
+                ticker = item.get("ticker")
+                if ticker:
+                    out[str(ticker)] = item
+        return out
 
     async def get_balance(self):
         return await self.request("GET", "/trade-api/v2/portfolio/balance", auth=True)
@@ -202,7 +250,21 @@ class PipKalshiClient:
 
     async def get_order(self, order_id: str):
         return await self.request(
-            "GET", f"/trade-api/v2/portfolio/events/orders/{order_id}", auth=True
+            "GET", f"/trade-api/v2/portfolio/orders/{order_id}", auth=True
+        )
+
+    async def get_fills(
+        self,
+        *,
+        order_id: str | None = None,
+        ticker: str | None = None,
+        limit: int = 1000,
+    ):
+        return await self.request(
+            "GET",
+            "/trade-api/v2/portfolio/fills",
+            params={"order_id": order_id, "ticker": ticker, "limit": limit},
+            auth=True,
         )
 
     async def create_order_v2(
@@ -219,7 +281,7 @@ class PipKalshiClient:
     ):
         if book_side not in {"bid", "ask"}:
             raise PipKalshiError("book_side must be bid or ask")
-        if not (Decimal("0.01") <= yes_price <= Decimal("0.99")):
+        if not (Decimal("0.0001") <= yes_price <= Decimal("0.9999")):
             raise PipKalshiError(f"Invalid YES-side price: {yes_price}")
         if count <= 0:
             raise PipKalshiError("count must be positive")
@@ -227,8 +289,8 @@ class PipKalshiClient:
             "ticker": ticker,
             "client_order_id": client_order_id,
             "side": book_side,
-            "count": str(count),
-            "price": format(yes_price.quantize(Decimal("0.01")), "f"),
+            "count": f"{count:.2f}",
+            "price": format(yes_price.quantize(Decimal("0.0001")), "f"),
             "time_in_force": time_in_force,
             "post_only": bool(post_only),
             "reduce_only": bool(reduce_only),
@@ -249,7 +311,6 @@ class PipKalshiClient:
 
 
 def fp(value: Any, default: str = "0") -> Decimal:
-    """Read Kalshi fixed-point fields safely."""
     if value is None or value == "":
         return D(default)
     return D(value)

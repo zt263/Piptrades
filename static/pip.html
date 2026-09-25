@@ -43,7 +43,13 @@
 var byId=function(id){return document.getElementById(id)};var token=localStorage.getItem('pipToken')||'';var settingTimer;var currentStatus=null;
 function headers(json){var h={};if(token)h['X-Pip-Token']=token;if(json)h['Content-Type']='application/json';return h}
 async function api(path,options){options=options||{};options.headers=Object.assign(headers(!!options.body),options.headers||{});var r=await fetch(path,options);if(r.status===401){byId('tokenBox').classList.add('show');throw new Error('unauthorized')}if(!r.ok)throw new Error(await r.text());return await r.json()}
-function money(n){n=Number(n)||0;return(n<0?'-</script>
+function money(n){n=Number(n)||0;var d=String.fromCharCode(36);return(n<0?'-'+d:d)+Math.abs(n).toFixed(2)}
+function pct(n){return(Number(n)*100).toFixed(Number(n)<.1?1:0)+'%'}
+function cents(n){return Math.round(Number(n)*100)+'c'}
+function cls(n){return Number(n)>0?'good':Number(n)<0?'bad':''}
+function esc(s){var d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML}
+function activityMode(n){n=Number(n);return n<25?'Selective':n<50?'Balanced':n<75?'Active':n<90?'Aggressive':'Max'}
+function activityDesc(n){var m=activityMode(n);if(m==='Selective')return 'Selective. Tight books, higher volume and stronger model signals.';if(m==='Balanced')return 'Balanced. Broad enough to hunt without forcing marginal setups.';if(m==='Active')return 'Active. Wider market universe and lower positive-edge threshold.';if(m==='Aggressive')return 'Aggressive. Accepts thinner/wider books if fee-adjusted EV stays positive.';return 'Max. Widest Pip hunting universe; size cap is unchanged and negative-EV trades remain blocked.'}</script>
 </body>
 </html>
 :'

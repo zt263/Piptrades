@@ -96,14 +96,16 @@ def quotes_for_market(market: dict[str, Any]) -> list[SideQuote]:
         volume_24h=vol,
         close_time=close_time,
     )
+    # Kalshi market payloads expose YES-side sizes. NO bid liquidity is the
+    # complementary YES ask liquidity; NO ask liquidity is complementary YES bid.
     no = SideQuote(
         ticker=ticker,
         title=title,
         side="no",
         bid=price_field(market, "no_bid"),
         ask=price_field(market, "no_ask"),
-        bid_size=size_field(market, "no_bid_size"),
-        ask_size=size_field(market, "no_ask_size"),
+        bid_size=size_field(market, "yes_ask_size"),
+        ask_size=size_field(market, "yes_bid_size"),
         volume_24h=vol,
         close_time=close_time,
     )
@@ -130,6 +132,38 @@ def _book_levels(orderbook_response: dict[str, Any]) -> tuple[list[tuple[Decimal
         return out
 
     return clean(yes_raw), clean(no_raw)
+
+
+def refresh_quote_from_orderbook(quote: SideQuote, orderbook_response: dict[str, Any]) -> SideQuote:
+    """Replace top-of-book prices/sizes with the authenticated live orderbook."""
+    yes_levels, no_levels = _book_levels(orderbook_response)
+    yes_levels.sort(key=lambda x: x[0], reverse=True)
+    no_levels.sort(key=lambda x: x[0], reverse=True)
+    yes_bid = yes_levels[0] if yes_levels else None
+    no_bid = no_levels[0] if no_levels else None
+
+    if quote.side == "yes":
+        bid = yes_bid[0] if yes_bid else quote.bid
+        ask = (Decimal("1") - no_bid[0]) if no_bid else quote.ask
+        bid_size = yes_bid[1] if yes_bid else quote.bid_size
+        ask_size = no_bid[1] if no_bid else quote.ask_size
+    else:
+        bid = no_bid[0] if no_bid else quote.bid
+        ask = (Decimal("1") - yes_bid[0]) if yes_bid else quote.ask
+        bid_size = no_bid[1] if no_bid else quote.bid_size
+        ask_size = yes_bid[1] if yes_bid else quote.ask_size
+
+    return SideQuote(
+        ticker=quote.ticker,
+        title=quote.title,
+        side=quote.side,
+        bid=bid,
+        ask=ask,
+        bid_size=bid_size,
+        ask_size=ask_size,
+        volume_24h=quote.volume_24h,
+        close_time=quote.close_time,
+    )
 
 
 def side_depths(side: str, quote: SideQuote, orderbook_response: dict[str, Any]) -> tuple[list[float], list[float]]:
@@ -217,7 +251,11 @@ class PipEngine:
                 raise PipKalshiError(f"{config.mode} mode requires Kalshi credentials")
             balance = await self.kalshi.get_balance()
             cash = self._balance_dollars(balance)
-            exposure = sum(float(p.get("entry_price") or p["intended_entry"]) * int(p["quantity"]) for p in positions if p["status"] != "pending_entry")
+            portfolio_value = float(balance.get("portfolio_value") or 0) / 100.0
+            exposure = sum(
+                float(p.get("entry_price") or p["intended_entry"]) * int(p["quantity"])
+                for p in positions if p["status"] != "pending_entry"
+            )
             unrealized = 0.0
             for p in positions:
                 if p["status"] == "pending_entry":
@@ -230,7 +268,8 @@ class PipEngine:
                         bid = float(q.bid)
                 if bid is not None:
                     unrealized += (float(bid) - entry) * int(p["quantity"])
-            equity = cash + exposure + unrealized
+            # Kalshi's portfolio_value includes account positions across exchange indexes.
+            equity = cash + portfolio_value
         return {
             "equity": max(0.0, equity),
             "cash": cash,
@@ -263,7 +302,6 @@ class PipEngine:
                     markets.append(market)
                     for q in quotes_for_market(market):
                         quote_map[(q.ticker, q.side)] = q
-                        self.history[(q.ticker, q.side)].append((time.time(), q.bid))
 
                 await self._reconcile_positions(config, quote_map)
                 await self._resolve_signals(config, model, quote_map)
@@ -284,17 +322,34 @@ class PipEngine:
                 passed_prefilter = len(prelim)
                 prelim = prelim[: config.effective_shortlist_size]
 
-                books: dict[str, dict[str, Any]] = {}
+                # Authenticate one bulk depth request (max 100 tickers) instead of
+                # hammering the exchange with one orderbook request per candidate.
+                depth_candidates = prelim[:100]
+                depth_tickers = list(dict.fromkeys(q.ticker for q in depth_candidates))
+                orderbook_error = None
+                try:
+                    books = await self.kalshi.get_orderbooks(depth_tickers) if depth_tickers else {}
+                except Exception as exc:
+                    books = {}
+                    orderbook_error = str(exc)
+                    await self.store.event("orderbook_error", orderbook_error, "error")
+
                 opportunities = []
-                for q in prelim:
-                    if q.ticker not in books:
-                        try:
-                            books[q.ticker] = await self.kalshi.get_orderbook(q.ticker, depth=20)
-                        except Exception:
-                            books[q.ticker] = {}
-                    opp = self._build_opportunity(q, books[q.ticker], config, model, snapshot)
+                refreshed_quotes: dict[tuple[str, str], SideQuote] = {}
+                for q in depth_candidates:
+                    book = books.get(q.ticker, {})
+                    live_q = refresh_quote_from_orderbook(q, book) if book else q
+                    refreshed_quotes[(live_q.ticker, live_q.side)] = live_q
+                    # Re-apply gates after the live book refresh; a candidate may have moved.
+                    if self._pre_filter_reason(live_q, config) is not None:
+                        continue
+                    self.history[(live_q.ticker, live_q.side)].append((time.time(), live_q.bid))
+                    opp = self._build_opportunity(live_q, book, config, model, snapshot)
                     if opp:
                         opportunities.append(opp)
+
+                # Prefer the authenticated top-of-book for position management/signals.
+                quote_map.update(refreshed_quotes)
 
                 opportunities.sort(key=lambda x: x["score"], reverse=True)
                 await self.store.replace_opportunities(opportunities)
@@ -309,6 +364,9 @@ class PipEngine:
                     "quotes": len(quote_map),
                     "passed_prefilter": passed_prefilter,
                     "shortlisted": len(prelim),
+                    "depth_checked": len(depth_tickers),
+                    "orderbooks_received": len(books),
+                    "orderbook_error": orderbook_error,
                     "ranked": len(opportunities),
                     "eligible": len(eligible),
                     "rejected": dict(rejected),
@@ -335,6 +393,7 @@ class PipEngine:
                     f"Scanned {len(markets)} markets; {len(opportunities)} ranked; {len(eligible)} eligible",
                     payload=self.last_scan_stats,
                 )
+                print(json.dumps({"event": "pip_scan", **self.last_scan_stats}), flush=True)
                 return opportunities
             finally:
                 self.scanning = False
@@ -534,29 +593,39 @@ class PipEngine:
             count=opp["quantity"], yes_price=yes_price, post_only=maker,
             time_in_force=("fill_or_kill" if reviewed and not maker else "good_till_canceled"),
         )
-        order = response.get("order", response)
-        order_id = order.get("order_id")
-        fill_count = int(float(order.get("fill_count") or 0))
-        avg_yes = order.get("average_fill_price")
-        actual_contract_price = self._contract_price_from_yes(opp["side"], avg_yes) if avg_yes is not None else None
-        if reviewed and not maker and fill_count <= 0:
+        order_id = response.get("order_id")
+        fill_count = int(float(response.get("fill_count") or 0))
+        remaining_count = int(float(response.get("remaining_count") or 0))
+        fill_summary = await self._created_order_fill_summary(response, opp["side"])
+        actual_qty = int(fill_summary["quantity"])
+        actual_contract_price = fill_summary["average_contract_price"]
+
+        if reviewed and not maker and actual_qty <= 0:
             await self.store.event(
                 "reviewed_live_no_fill",
                 f"Reviewed live entry did not fill {opp['ticker']} {opp['side'].upper()}",
                 "warning",
             )
             return False
-        status = "open" if fill_count > 0 else "pending_entry"
-        qty = fill_count if fill_count > 0 else opp["quantity"]
-        if fill_count > 0 and int(float(order.get("remaining_count") or 0)) > 0 and order_id:
-            await self.kalshi.cancel_order_v2(order_id, opp["ticker"])
+
+        if actual_qty > 0 and remaining_count > 0 and order_id:
+            try:
+                await self.kalshi.cancel_order_v2(order_id, opp["ticker"])
+            except Exception as exc:
+                await self.store.event("partial_entry_cancel_error", str(exc), "warning")
+
+        if actual_qty > 0 and actual_contract_price is None:
+            raise PipKalshiError("Kalshi reported a fill but Pip could not resolve its price")
+
+        status = "open" if actual_qty > 0 else "pending_entry"
+        qty = actual_qty if actual_qty > 0 else opp["quantity"]
         pid = await self.store.create_position({
             "ticker": opp["ticker"], "side": opp["side"], "mode": config.mode,
             "status": status, "quantity": qty, "intended_entry": opp["entry_price"],
-            "entry_price": float(actual_contract_price) if actual_contract_price else None,
-            "entry_fee": float(order.get("average_fee_paid") or 0),
+            "entry_price": float(actual_contract_price) if actual_contract_price is not None else None,
+            "entry_fee": float(fill_summary["total_fee"]),
             "target_price": opp["target_price"], "stop_price": opp["stop_price"],
-            "opened_at": utcnow() if fill_count > 0 else None,
+            "opened_at": utcnow() if actual_qty > 0 else None,
             "max_hold_minutes": config.max_hold_minutes, "entry_order_id": order_id,
             "rationale": rationale,
         })
@@ -570,9 +639,13 @@ class PipEngine:
         if not self.kalshi.authenticated:
             raise PipKalshiError("Kalshi credentials are not configured")
         payload = await self.kalshi.get_balance()
+        cash = self._balance_dollars(payload)
+        portfolio_value = float(payload.get("portfolio_value") or 0) / 100.0
         return {
             "environment": self.kalshi.environment.name,
-            "cash": self._balance_dollars(payload),
+            "cash": cash,
+            "portfolio_value": portfolio_value,
+            "equity": cash + portfolio_value,
             "authenticated": True,
         }
 
@@ -669,6 +742,65 @@ class PipEngine:
         result = await self._submit_exit(position, quote.bid, reason, reviewed=True)
         return result or {"submitted": False}
 
+    async def _fill_summary(self, order_id: str, contract_side: str) -> dict[str, Any]:
+        data = await self.kalshi.get_fills(order_id=order_id)
+        fills = data.get("fills", [])
+        total_qty = Decimal("0")
+        total_cost = Decimal("0")
+        total_fee = Decimal("0")
+        for fill in fills:
+            qty = D(fill.get("count_fp") or 0)
+            if qty <= 0:
+                continue
+            price_key = "yes_price_dollars" if contract_side == "yes" else "no_price_dollars"
+            price = D(fill.get(price_key) or 0)
+            total_qty += qty
+            total_cost += qty * price
+            total_fee += D(fill.get("fee_cost") or 0)
+        avg_price = (total_cost / total_qty) if total_qty > 0 else None
+        return {
+            "quantity": int(total_qty),
+            "average_contract_price": avg_price,
+            "total_fee": total_fee,
+            "fills": fills,
+        }
+
+    async def _created_order_fill_summary(
+        self,
+        response: dict[str, Any],
+        contract_side: str,
+    ) -> dict[str, Any]:
+        order_id = response.get("order_id")
+        fill_count = int(float(response.get("fill_count") or 0))
+        if fill_count <= 0:
+            return {
+                "quantity": 0,
+                "average_contract_price": None,
+                "total_fee": Decimal("0"),
+                "fills": [],
+            }
+        if order_id:
+            try:
+                summary = await self._fill_summary(order_id, contract_side)
+                if summary["quantity"] > 0:
+                    return summary
+            except Exception:
+                pass
+
+        # Fallback to the synchronous create response if the fills endpoint lags.
+        yes_avg = response.get("average_fill_price")
+        contract_avg = (
+            self._contract_price_from_yes(contract_side, yes_avg)
+            if yes_avg is not None else None
+        )
+        per_contract_fee = D(response.get("average_fee_paid") or 0)
+        return {
+            "quantity": fill_count,
+            "average_contract_price": contract_avg,
+            "total_fee": per_contract_fee * D(fill_count),
+            "fills": [],
+        }
+
     def _contract_price_from_yes(self, side: str, yes_price: Any) -> Decimal:
         p = D(yes_price)
         if p > 1:
@@ -703,8 +835,8 @@ class PipEngine:
         except Exception:
             return
         order = response.get("order", response)
-        fill_count = int(float(order.get("fill_count") or 0))
-        remaining = int(float(order.get("remaining_count") or 0))
+        fill_count = int(float(order.get("fill_count_fp") or 0))
+        remaining = int(float(order.get("remaining_count_fp") or 0))
         if fill_count <= 0:
             return
         if remaining > 0:
@@ -712,11 +844,13 @@ class PipEngine:
                 await self.kalshi.cancel_order_v2(p["entry_order_id"], p["ticker"])
             except Exception:
                 pass
-        avg_yes = order.get("average_fill_price")
-        price = self._contract_price_from_yes(p["side"], avg_yes) if avg_yes is not None else D(p["intended_entry"])
+        summary = await self._fill_summary(p["entry_order_id"], p["side"])
+        if summary["quantity"] <= 0 or summary["average_contract_price"] is None:
+            return
         await self.store.update_position(
-            p["id"], status="open", quantity=fill_count, entry_price=float(price),
-            entry_fee=float(order.get("average_fee_paid") or 0), opened_at=utcnow(),
+            p["id"], status="open", quantity=summary["quantity"],
+            entry_price=float(summary["average_contract_price"]),
+            entry_fee=float(summary["total_fee"]), opened_at=utcnow(),
         )
         await self.store.event("fill", f"{p['mode']} entry filled {p['ticker']} {p['side'].upper()}")
 
@@ -781,8 +915,9 @@ class PipEngine:
             await self.store.event("exit_error", f"Exit submission failed {p['ticker']}: {exc}", "error")
             return {"submitted": False, "error": str(exc)}
 
-        order = response.get("order", response)
-        filled = int(float(order.get("fill_count") or 0))
+        fill_summary = await self._created_order_fill_summary(response, p["side"])
+        filled = int(fill_summary["quantity"])
+        order_id = response.get("order_id")
         if filled <= 0:
             await self.store.event(
                 "exit_no_fill",
@@ -790,24 +925,24 @@ class PipEngine:
                 "warning",
                 payload={"position_id": p["id"], "reason": reason},
             )
-            return {"submitted": True, "filled": 0, "order_id": order.get("order_id")}
+            return {"submitted": True, "filled": 0, "order_id": order_id}
 
-        avg_yes = order.get("average_fill_price")
-        exit_price = self._contract_price_from_yes(p["side"], avg_yes) if avg_yes is not None else exit_contract_price
-        fee = float(order.get("average_fee_paid") or 0)
+        exit_price = fill_summary["average_contract_price"]
+        if exit_price is None:
+            raise PipKalshiError("Kalshi reported an exit fill but Pip could not resolve its price")
         pnl = await self.store.record_partial_exit(
             p,
             filled_quantity=filled,
             exit_price=float(exit_price),
-            exit_fee=fee,
+            exit_fee=float(fill_summary["total_fee"]),
             exit_reason=reason,
         )
         await self.store.event(
             "reviewed_live_exit" if reviewed and p["mode"] == "live" else "exit",
             f"{p['mode']} exit filled {p['ticker']}: {pnl:+.2f}",
-            payload={"pnl": pnl, "filled": filled, "order_id": order.get("order_id")},
+            payload={"pnl": pnl, "filled": filled, "order_id": order_id},
         )
-        return {"submitted": True, "filled": filled, "order_id": order.get("order_id"), "pnl": pnl}
+        return {"submitted": True, "filled": filled, "order_id": order_id, "pnl": pnl}
 
     async def _reconcile_pending_exit(self, p: dict[str, Any]):
         if not p.get("exit_order_id") or not self.kalshi.authenticated:
@@ -817,17 +952,22 @@ class PipEngine:
         except Exception:
             return
         order = response.get("order", response)
-        filled = int(float(order.get("fill_count") or 0))
+        filled = int(float(order.get("fill_count_fp") or 0))
         if filled <= 0:
             return
-        avg_yes = order.get("average_fill_price")
-        exit_price = self._contract_price_from_yes(p["side"], avg_yes) if avg_yes is not None else D(p.get("last_bid") or 0)
+        summary = await self._fill_summary(p["exit_order_id"], p["side"])
+        if summary["quantity"] <= 0 or summary["average_contract_price"] is None:
+            return
         reason = "exchange_exit"
         rationale = p.get("rationale") or ""
         if "|exit:" in rationale:
             reason = rationale.rsplit("|exit:", 1)[-1]
-        pnl = await self.store.close_position(
-            p, exit_price=float(exit_price), exit_fee=float(order.get("average_fee_paid") or 0), exit_reason=reason
+        pnl = await self.store.record_partial_exit(
+            p,
+            filled_quantity=summary["quantity"],
+            exit_price=float(summary["average_contract_price"]),
+            exit_fee=float(summary["total_fee"]),
+            exit_reason=reason,
         )
         await self.store.event("exit", f"{p['mode']} exit filled {p['ticker']}: {pnl:+.2f}", payload={"pnl": pnl})
 
