@@ -245,8 +245,15 @@ function renderOpportunities(rows){
   var eligible=rows.filter(isEligible).length;
   var exploratory=rows.filter(isExploratory).length;
   el('opportunitySummary').textContent=rows.length+' ranked · '+eligible+' model-eligible · '+exploratory+' late-close';
-  el('opportunityEmpty').classList.toggle('hidden',rows.length>0);
-  el('opportunityRows').innerHTML=rows.slice(0,40).map(function(r){
+  var ordered=rows.slice().sort(function(a,b){
+    var ar=(isEligible(a)||isExploratory(a))?1:0;
+    var br=(isEligible(b)||isExploratory(b))?1:0;
+    if(ar!==br)return br-ar;
+    if(isExploratory(a)!==isExploratory(b))return isExploratory(b)?1:-1;
+    return Number(b.score||0)-Number(a.score||0);
+  });
+  el('opportunityEmpty').classList.toggle('hidden',ordered.length>0);
+  el('opportunityRows').innerHTML=ordered.slice(0,60).map(function(r){
     var eligibleNow=isEligible(r);
     var exploratoryNow=isExploratory(r);
     var reviewable=eligibleNow||exploratoryNow;
