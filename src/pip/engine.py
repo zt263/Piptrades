@@ -1,0 +1,706 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import math
+import time
+import uuid
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Any
+
+from .config import PipConfig
+from .kalshi import PipKalshiClient, PipKalshiError, fp
+from .math import (
+    CENT,
+    D,
+    book_imbalance,
+    conservative_maker_fee,
+    expected_value,
+    kalshi_fee,
+    max_contract_count,
+    side_to_v2_entry,
+    side_to_v2_exit,
+    trade_economics,
+)
+from .model import PipSignalModel
+from .store import PipStore, utcnow
+
+
+@dataclass(frozen=True)
+class SideQuote:
+    ticker: str
+    title: str
+    side: str
+    bid: Decimal
+    ask: Decimal
+    bid_size: float
+    ask_size: float
+    volume_24h: float
+    close_time: str | None
+
+    @property
+    def spread(self) -> Decimal:
+        return max(Decimal("0"), self.ask - self.bid)
+
+
+def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, x))
+
+
+def parse_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def price_field(market: dict[str, Any], name: str) -> Decimal:
+    dollars = market.get(f"{name}_dollars")
+    if dollars not in (None, ""):
+        return fp(dollars)
+    raw = market.get(name)
+    if raw in (None, ""):
+        return Decimal("0")
+    d = D(raw)
+    return d / D(100) if d > 1 else d
+
+
+def size_field(market: dict[str, Any], name: str) -> float:
+    raw = market.get(f"{name}_fp", market.get(name, 0))
+    try:
+        return float(raw or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def quotes_for_market(market: dict[str, Any]) -> list[SideQuote]:
+    ticker = str(market.get("ticker") or "")
+    if not ticker:
+        return []
+    title = str(market.get("title") or market.get("subtitle") or ticker)
+    vol = size_field(market, "volume_24h") or size_field(market, "volume")
+    close_time = market.get("close_time")
+    yes = SideQuote(
+        ticker=ticker,
+        title=title,
+        side="yes",
+        bid=price_field(market, "yes_bid"),
+        ask=price_field(market, "yes_ask"),
+        bid_size=size_field(market, "yes_bid_size"),
+        ask_size=size_field(market, "yes_ask_size"),
+        volume_24h=vol,
+        close_time=close_time,
+    )
+    no = SideQuote(
+        ticker=ticker,
+        title=title,
+        side="no",
+        bid=price_field(market, "no_bid"),
+        ask=price_field(market, "no_ask"),
+        bid_size=size_field(market, "no_bid_size"),
+        ask_size=size_field(market, "no_ask_size"),
+        volume_24h=vol,
+        close_time=close_time,
+    )
+    return [yes, no]
+
+
+def _book_levels(orderbook_response: dict[str, Any]) -> tuple[list[tuple[Decimal, float]], list[tuple[Decimal, float]]]:
+    ob = orderbook_response.get("orderbook") or orderbook_response.get("orderbook_fp") or orderbook_response
+    yes_raw = ob.get("yes_dollars") or ob.get("yes") or []
+    no_raw = ob.get("no_dollars") or ob.get("no") or []
+
+    def clean(levels):
+        out = []
+        for level in levels:
+            if not isinstance(level, (list, tuple)) or len(level) < 2:
+                continue
+            try:
+                p = D(level[0])
+                if p > 1:
+                    p /= D(100)
+                out.append((p, float(level[1])))
+            except Exception:
+                continue
+        return out
+
+    return clean(yes_raw), clean(no_raw)
+
+
+def side_depths(side: str, quote: SideQuote, orderbook_response: dict[str, Any]) -> tuple[list[float], list[float]]:
+    """Near-touch support versus opposing depth, expressed in contract-side prices."""
+    yes_levels, no_levels = _book_levels(orderbook_response)
+    width = Decimal("0.03")
+    if side == "yes":
+        support = [q for p, q in yes_levels if p >= quote.bid - width]
+        opposing = [q for p, q in no_levels if (Decimal("1") - p) <= quote.ask + width]
+    else:
+        support = [q for p, q in no_levels if p >= quote.bid - width]
+        opposing = [q for p, q in yes_levels if (Decimal("1") - p) <= quote.ask + width]
+    return support, opposing
+
+
+class PipEngine:
+    def __init__(self, store: PipStore, kalshi: PipKalshiClient):
+        self.store = store
+        self.kalshi = kalshi
+        self.stop_event = asyncio.Event()
+        self.history: dict[tuple[str, str], deque[tuple[float, Decimal]]] = defaultdict(lambda: deque(maxlen=12))
+        self.last_scan_at: str | None = None
+        self.last_scan_error: str | None = None
+        self.scanning = False
+        self._loop_task: asyncio.Task | None = None
+        self._lock = asyncio.Lock()
+
+    async def start_background(self):
+        if self._loop_task and not self._loop_task.done():
+            return
+        self.stop_event.clear()
+        self._loop_task = asyncio.create_task(self.run_forever(), name="pip-trading-loop")
+
+    async def stop_background(self):
+        self.stop_event.set()
+        if self._loop_task:
+            try:
+                await asyncio.wait_for(self._loop_task, timeout=5)
+            except Exception:
+                self._loop_task.cancel()
+
+    async def run_forever(self):
+        await self.store.event("agent", "Pip trading loop started")
+        while not self.stop_event.is_set():
+            config = await self.store.load_config()
+            if config.agent_enabled:
+                try:
+                    await self.scan_once()
+                except Exception as exc:
+                    self.last_scan_error = str(exc)
+                    await self.store.event("scan_error", str(exc), "error")
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=config.scan_interval_seconds)
+            except asyncio.TimeoutError:
+                pass
+        await self.store.event("agent", "Pip trading loop stopped")
+
+    async def equity_snapshot(self, config: PipConfig, quote_map: dict[tuple[str, str], SideQuote] | None = None) -> dict[str, float]:
+        positions = await self.store.positions()
+        realized = await self.store.realized_pnl()
+        if config.mode == "paper":
+            exposure = 0.0
+            unrealized = 0.0
+            reserved = 0.0
+            for p in positions:
+                qty = int(p["quantity"])
+                if p["status"] == "pending_entry":
+                    reserved += float(p["intended_entry"]) * qty
+                    continue
+                entry = float(p["entry_price"] or p["intended_entry"])
+                exposure += entry * qty
+                bid = p.get("last_bid")
+                if quote_map:
+                    q = quote_map.get((p["ticker"], p["side"]))
+                    if q:
+                        bid = float(q.bid)
+                if bid is not None:
+                    unrealized += (float(bid) - entry) * qty - float(p.get("entry_fee") or 0)
+            equity = config.paper_starting_equity + realized + unrealized
+            cash = config.paper_starting_equity + realized - exposure - reserved
+        else:
+            if not self.kalshi.authenticated:
+                raise PipKalshiError(f"{config.mode} mode requires Kalshi credentials")
+            balance = await self.kalshi.get_balance()
+            cash = self._balance_dollars(balance)
+            exposure = sum(float(p.get("entry_price") or p["intended_entry"]) * int(p["quantity"]) for p in positions if p["status"] != "pending_entry")
+            unrealized = 0.0
+            for p in positions:
+                if p["status"] == "pending_entry":
+                    continue
+                entry = float(p.get("entry_price") or p["intended_entry"])
+                bid = p.get("last_bid")
+                if quote_map:
+                    q = quote_map.get((p["ticker"], p["side"]))
+                    if q:
+                        bid = float(q.bid)
+                if bid is not None:
+                    unrealized += (float(bid) - entry) * int(p["quantity"])
+            equity = cash + exposure + unrealized
+        return {
+            "equity": max(0.0, equity),
+            "cash": cash,
+            "exposure": exposure,
+            "realized_pnl": realized,
+            "unrealized_pnl": unrealized,
+        }
+
+    def _balance_dollars(self, payload: dict[str, Any]) -> float:
+        for key in ("balance_dollars", "available_balance_dollars", "cash_balance_dollars"):
+            if payload.get(key) not in (None, ""):
+                return float(payload[key])
+        for key in ("balance", "available_balance", "cash_balance"):
+            if payload.get(key) not in (None, ""):
+                val = float(payload[key])
+                return val / 100.0 if val > 100 else val
+        raise PipKalshiError("Could not read account balance from Kalshi response")
+
+    async def scan_once(self) -> list[dict[str, Any]]:
+        if self._lock.locked():
+            return await self.store.opportunities()
+        async with self._lock:
+            self.scanning = True
+            try:
+                config = await self.store.load_config()
+                model = await self.store.load_model()
+                markets = []
+                quote_map: dict[tuple[str, str], SideQuote] = {}
+                async for market in self.kalshi.iter_open_markets():
+                    markets.append(market)
+                    for q in quotes_for_market(market):
+                        quote_map[(q.ticker, q.side)] = q
+                        self.history[(q.ticker, q.side)].append((time.time(), q.bid))
+
+                await self._reconcile_positions(config, quote_map)
+                await self._resolve_signals(config, model, quote_map)
+
+                snapshot = await self.equity_snapshot(config, quote_map)
+                await self.store.record_equity(**snapshot)
+                killed = await self._risk_kill_check(config, snapshot)
+
+                prelim = []
+                for q in quote_map.values():
+                    if self._pre_filter(q, config):
+                        prelim.append(q)
+                prelim.sort(key=lambda q: (float(q.spread), -q.volume_24h, -q.ask_size))
+                prelim = prelim[: config.shortlist_size]
+
+                books: dict[str, dict[str, Any]] = {}
+                opportunities = []
+                for q in prelim:
+                    if q.ticker not in books:
+                        try:
+                            books[q.ticker] = await self.kalshi.get_orderbook(q.ticker, depth=20)
+                        except Exception:
+                            books[q.ticker] = {}
+                    opp = self._build_opportunity(q, books[q.ticker], config, model, snapshot)
+                    if opp:
+                        opportunities.append(opp)
+
+                opportunities.sort(key=lambda x: x["score"], reverse=True)
+                await self.store.replace_opportunities(opportunities)
+
+                expires = (datetime.now(timezone.utc) + timedelta(minutes=config.signal_horizon_minutes)).isoformat()
+                for opp in opportunities[: min(15, len(opportunities))]:
+                    await self.store.add_signal(opp, expires)
+
+                if config.agent_enabled and config.auto_trade and not killed:
+                    await self._enter_qualified(config, snapshot, opportunities)
+
+                self.last_scan_at = utcnow()
+                self.last_scan_error = None
+                await self.store.event(
+                    "scan",
+                    f"Scanned {len(markets)} markets; {len(opportunities)} Pip opportunities",
+                    payload={"markets": len(markets), "opportunities": len(opportunities)},
+                )
+                return opportunities
+            finally:
+                self.scanning = False
+
+    def _pre_filter(self, q: SideQuote, config: PipConfig) -> bool:
+        if q.ask <= 0 or q.bid <= 0:
+            return False
+        if not (D(config.min_contract_price) <= q.ask <= D(config.max_contract_price)):
+            return False
+        if q.spread <= 0 or q.spread > D(config.max_spread_cents) * CENT:
+            return False
+        if q.volume_24h < config.min_volume_24h:
+            return False
+        if q.ask >= Decimal("1"):
+            return False
+        if q.close_time:
+            close = parse_time(q.close_time)
+            if close and close <= datetime.now(timezone.utc) + timedelta(minutes=5):
+                return False
+        if q.ticker.startswith("KXMVE"):
+            return False
+        return True
+
+    def _momentum(self, q: SideQuote) -> float:
+        hist = self.history[(q.ticker, q.side)]
+        if len(hist) < 2:
+            return 0.0
+        old = hist[0][1]
+        move_cents = float((q.bid - old) / CENT)
+        return max(-1.0, min(1.0, move_cents / 2.0))
+
+    def _build_opportunity(
+        self,
+        q: SideQuote,
+        orderbook: dict[str, Any],
+        config: PipConfig,
+        model: PipSignalModel,
+        snapshot: dict[str, float],
+    ) -> dict[str, Any] | None:
+        support, opposing = side_depths(q.side, q, orderbook)
+        imbalance = book_imbalance(support, opposing)
+        momentum = self._momentum(q)
+        spread_cents = float(q.spread / CENT)
+        spread_quality = clamp(1.0 - (spread_cents / max(1.0, config.max_spread_cents)))
+        near_depth = sum(support) + sum(opposing)
+        liquidity = clamp(math.log10(near_depth + 1) / 2.5)
+        volume = clamp(math.log10(q.volume_24h + 1) / 4.0)
+        price_extremity = clamp((float(q.ask) - config.min_contract_price) / max(0.01, config.max_contract_price - config.min_contract_price))
+        features = {
+            "imbalance": imbalance,
+            "momentum": momentum,
+            "spread_quality": spread_quality,
+            "liquidity": liquidity,
+            "volume": volume,
+            "price_extremity": price_extremity,
+        }
+        probability = model.predict(features)
+
+        intended, entry_is_maker = self._entry_price(q, config)
+        target = min(Decimal("0.99"), intended + D(config.take_profit_cents) * CENT)
+        stop = max(Decimal("0.01"), intended - D(config.stop_loss_cents) * CENT)
+        count = max_contract_count(
+            D(snapshot["equity"]), intended, config.effective_position_pct, config.effective_order_pct
+        )
+        if count < 1 or target <= intended:
+            return None
+        econ = trade_economics(count, intended, target, stop, entry_is_maker=entry_is_maker)
+        ev = expected_value(probability, econ)
+        fill_factor = 0.70 if entry_is_maker else 1.0
+        velocity = max(0.1, float(ev)) * fill_factor / max(5.0, config.signal_horizon_minutes)
+        score = (probability * 100.0) + (float(ev) * 35.0) + (velocity * 1000.0) + (imbalance * 4.0)
+        return {
+            "ticker": q.ticker,
+            "title": q.title,
+            "side": q.side,
+            "observed_at": utcnow(),
+            "entry_price": float(intended),
+            "target_price": float(target),
+            "stop_price": float(stop),
+            "spread": float(q.spread),
+            "probability": probability,
+            "expected_value": float(ev),
+            "score": score,
+            "quantity": count,
+            "features": features,
+            "break_even_probability": econ.break_even_probability,
+            "entry_is_maker": entry_is_maker,
+            "entry_fee_estimate": float(econ.entry_fee),
+        }
+
+    def _entry_price(self, q: SideQuote, config: PipConfig) -> tuple[Decimal, bool]:
+        if config.entry_style == "taker":
+            return q.ask, False
+        maker = min(q.ask - CENT, q.bid + CENT) if q.spread >= D("0.02") else q.bid
+        maker = max(Decimal("0.01"), min(Decimal("0.99"), maker))
+        if config.entry_style == "maker":
+            return maker, True
+        return (maker, True) if q.spread >= D("0.02") else (q.ask, False)
+
+    async def _enter_qualified(self, config: PipConfig, snapshot: dict[str, float], opportunities: list[dict[str, Any]]):
+        positions = await self.store.positions()
+        open_keys = {(p["ticker"], p["side"]) for p in positions}
+        equity = max(0.01, snapshot["equity"])
+        exposure = snapshot["exposure"] + sum(
+            float(p["intended_entry"]) * int(p["quantity"])
+            for p in positions if p["status"] == "pending_entry"
+        )
+        max_exposure = equity * config.max_total_exposure_pct
+        cash_floor = equity * config.min_cash_reserve_pct
+        max_new = max(1, 1 + config.trade_activity // 25)
+        entered = 0
+
+        for opp in opportunities:
+            if entered >= max_new or len(positions) + entered >= config.max_open_positions:
+                break
+            if (opp["ticker"], opp["side"]) in open_keys:
+                continue
+            if opp["probability"] < config.min_signal_probability:
+                continue
+            if opp["expected_value"] < config.min_expected_value_dollars or opp["expected_value"] <= 0:
+                continue
+            position_notional = opp["entry_price"] * opp["quantity"]
+            hard_cap = equity * PipConfig.HARD_MAX_POSITION_PCT
+            if position_notional > hard_cap + 1e-9:
+                continue
+            if exposure + position_notional > max_exposure + 1e-9:
+                continue
+            if snapshot["cash"] - position_notional < cash_floor - 1e-9:
+                continue
+
+            ok = await self._submit_entry(config, opp)
+            if ok:
+                exposure += position_notional
+                entered += 1
+                open_keys.add((opp["ticker"], opp["side"]))
+
+    async def _submit_entry(self, config: PipConfig, opp: dict[str, Any]) -> bool:
+        maker = bool(opp["entry_is_maker"])
+        rationale = json.dumps({
+            "probability": opp["probability"],
+            "expected_value": opp["expected_value"],
+            "features": opp["features"],
+        })
+        if config.mode == "paper":
+            if maker:
+                status = "pending_entry"
+                entry_price = None
+                entry_fee = 0.0
+                opened_at = None
+            else:
+                status = "open"
+                entry_price = opp["entry_price"]
+                entry_fee = float(kalshi_fee(opp["quantity"], D(opp["entry_price"])))
+                opened_at = utcnow()
+            pid = await self.store.create_position({
+                "ticker": opp["ticker"], "side": opp["side"], "mode": "paper",
+                "status": status, "quantity": opp["quantity"],
+                "intended_entry": opp["entry_price"], "entry_price": entry_price,
+                "entry_fee": entry_fee, "target_price": opp["target_price"],
+                "stop_price": opp["stop_price"], "opened_at": opened_at,
+                "max_hold_minutes": config.max_hold_minutes, "last_bid": None,
+                "rationale": rationale,
+            })
+            if pid:
+                await self.store.event("entry", f"Pip {'rested' if maker else 'filled'} paper {opp['side'].upper()} {opp['ticker']}", payload=opp)
+                return True
+            return False
+
+        if config.mode == "live" and not config.can_submit_real_money():
+            await self.store.event("live_locked", "Live order blocked: PIP_LIVE_EXECUTION_ENABLED is false", "warning")
+            return False
+        expected_env = "production" if config.mode == "live" else "demo"
+        if self.kalshi.environment.name != expected_env:
+            await self.store.event("env_mismatch", f"{config.mode} mode requires KALSHI_ENV={expected_env}", "error")
+            return False
+        if not self.kalshi.authenticated:
+            return False
+
+        book_side, yes_price = side_to_v2_entry(opp["side"], D(opp["entry_price"]))
+        response = await self.kalshi.create_order_v2(
+            ticker=opp["ticker"], client_order_id=str(uuid.uuid4()), book_side=book_side,
+            count=opp["quantity"], yes_price=yes_price, post_only=maker,
+        )
+        order = response.get("order", response)
+        order_id = order.get("order_id")
+        fill_count = int(float(order.get("fill_count") or 0))
+        avg_yes = order.get("average_fill_price")
+        actual_contract_price = self._contract_price_from_yes(opp["side"], avg_yes) if avg_yes is not None else None
+        status = "open" if fill_count > 0 else "pending_entry"
+        qty = fill_count if fill_count > 0 else opp["quantity"]
+        if fill_count > 0 and int(float(order.get("remaining_count") or 0)) > 0 and order_id:
+            await self.kalshi.cancel_order_v2(order_id, opp["ticker"])
+        pid = await self.store.create_position({
+            "ticker": opp["ticker"], "side": opp["side"], "mode": config.mode,
+            "status": status, "quantity": qty, "intended_entry": opp["entry_price"],
+            "entry_price": float(actual_contract_price) if actual_contract_price else None,
+            "entry_fee": float(order.get("average_fee_paid") or 0),
+            "target_price": opp["target_price"], "stop_price": opp["stop_price"],
+            "opened_at": utcnow() if fill_count > 0 else None,
+            "max_hold_minutes": config.max_hold_minutes, "entry_order_id": order_id,
+            "rationale": rationale,
+        })
+        if pid:
+            await self.store.event("entry_order", f"Submitted {config.mode} entry for {opp['ticker']}", payload={"order_id": order_id, **opp})
+            return True
+        return False
+
+    def _contract_price_from_yes(self, side: str, yes_price: Any) -> Decimal:
+        p = D(yes_price)
+        if p > 1:
+            p /= D(100)
+        return p if side == "yes" else Decimal("1") - p
+
+    async def _reconcile_positions(self, config: PipConfig, quote_map: dict[tuple[str, str], SideQuote]):
+        positions = await self.store.positions()
+        for p in positions:
+            q = quote_map.get((p["ticker"], p["side"]))
+            if q:
+                await self.store.update_position(p["id"], last_bid=float(q.bid))
+            if p["status"] == "pending_entry":
+                await self._reconcile_pending_entry(p, q)
+            elif p["status"] == "open":
+                await self._manage_open_position(p, q)
+            elif p["status"] == "pending_exit":
+                await self._reconcile_pending_exit(p)
+
+    async def _reconcile_pending_entry(self, p: dict[str, Any], q: SideQuote | None):
+        if p["mode"] == "paper":
+            if q and q.ask <= D(p["intended_entry"]):
+                price = float(D(p["intended_entry"]))
+                fee = float(conservative_maker_fee(int(p["quantity"]), D(price)))
+                await self.store.update_position(p["id"], status="open", entry_price=price, entry_fee=fee, opened_at=utcnow())
+                await self.store.event("fill", f"Paper maker entry filled {p['ticker']} {p['side'].upper()}")
+            return
+        if not p.get("entry_order_id") or not self.kalshi.authenticated:
+            return
+        try:
+            response = await self.kalshi.get_order(p["entry_order_id"])
+        except Exception:
+            return
+        order = response.get("order", response)
+        fill_count = int(float(order.get("fill_count") or 0))
+        remaining = int(float(order.get("remaining_count") or 0))
+        if fill_count <= 0:
+            return
+        if remaining > 0:
+            try:
+                await self.kalshi.cancel_order_v2(p["entry_order_id"], p["ticker"])
+            except Exception:
+                pass
+        avg_yes = order.get("average_fill_price")
+        price = self._contract_price_from_yes(p["side"], avg_yes) if avg_yes is not None else D(p["intended_entry"])
+        await self.store.update_position(
+            p["id"], status="open", quantity=fill_count, entry_price=float(price),
+            entry_fee=float(order.get("average_fee_paid") or 0), opened_at=utcnow(),
+        )
+        await self.store.event("fill", f"{p['mode']} entry filled {p['ticker']} {p['side'].upper()}")
+
+    async def _manage_open_position(self, p: dict[str, Any], q: SideQuote | None):
+        if not q or not p.get("entry_price"):
+            return
+        bid = q.bid
+        target = D(p["target_price"])
+        stop = D(p["stop_price"])
+        opened = parse_time(p["opened_at"])
+        held_minutes = ((datetime.now(timezone.utc) - opened).total_seconds() / 60.0) if opened else 0
+        reason = None
+        if bid >= target:
+            reason = "target"
+        elif bid <= stop:
+            reason = "stop"
+        elif held_minutes >= int(p["max_hold_minutes"]):
+            reason = "time"
+        elif q.close_time:
+            close = parse_time(q.close_time)
+            if close and close <= datetime.now(timezone.utc) + timedelta(minutes=5):
+                reason = "market_closing"
+        if reason:
+            await self._submit_exit(p, bid, reason)
+
+    async def _submit_exit(self, p: dict[str, Any], bid: Decimal, reason: str):
+        qty = int(p["quantity"])
+        if p["mode"] == "paper":
+            maker = reason == "target"
+            exit_price = D(p["target_price"]) if maker else bid
+            fee = conservative_maker_fee(qty, exit_price) if maker else kalshi_fee(qty, exit_price)
+            pnl = await self.store.close_position(p, exit_price=float(exit_price), exit_fee=float(fee), exit_reason=reason)
+            await self.store.event("exit", f"Paper exit {p['ticker']} {reason}: {pnl:+.2f}", payload={"pnl": pnl})
+            return
+        config = await self.store.load_config()
+        if p["mode"] == "live" and not config.can_submit_real_money():
+            await self.store.event("live_locked", "Live exit blocked by environment gate", "error")
+            return
+        exit_contract_price = D(p["target_price"]) if reason == "target" else bid
+        book_side, yes_price = side_to_v2_exit(p["side"], exit_contract_price)
+        try:
+            response = await self.kalshi.create_order_v2(
+                ticker=p["ticker"], client_order_id=str(uuid.uuid4()), book_side=book_side,
+                count=qty, yes_price=yes_price, post_only=(reason == "target"),
+            )
+        except Exception as exc:
+            await self.store.event("exit_error", f"Exit submission failed {p['ticker']}: {exc}", "error")
+            return
+        order = response.get("order", response)
+        oid = order.get("order_id")
+        await self.store.update_position(p["id"], status="pending_exit", exit_order_id=oid, rationale=(p.get("rationale") or "") + f"|exit:{reason}")
+
+    async def _reconcile_pending_exit(self, p: dict[str, Any]):
+        if not p.get("exit_order_id") or not self.kalshi.authenticated:
+            return
+        try:
+            response = await self.kalshi.get_order(p["exit_order_id"])
+        except Exception:
+            return
+        order = response.get("order", response)
+        filled = int(float(order.get("fill_count") or 0))
+        if filled <= 0:
+            return
+        avg_yes = order.get("average_fill_price")
+        exit_price = self._contract_price_from_yes(p["side"], avg_yes) if avg_yes is not None else D(p.get("last_bid") or 0)
+        reason = "exchange_exit"
+        rationale = p.get("rationale") or ""
+        if "|exit:" in rationale:
+            reason = rationale.rsplit("|exit:", 1)[-1]
+        pnl = await self.store.close_position(
+            p, exit_price=float(exit_price), exit_fee=float(order.get("average_fee_paid") or 0), exit_reason=reason
+        )
+        await self.store.event("exit", f"{p['mode']} exit filled {p['ticker']}: {pnl:+.2f}", payload={"pnl": pnl})
+
+    async def _resolve_signals(self, config: PipConfig, model: PipSignalModel, quote_map: dict[tuple[str, str], SideQuote]):
+        changed = False
+        now = datetime.now(timezone.utc)
+        for signal in await self.store.pending_signals():
+            q = quote_map.get((signal["ticker"], signal["side"]))
+            expiry = parse_time(signal["expires_at"])
+            outcome = None
+            if q and q.bid >= D(signal["target_price"]):
+                outcome = 1
+            elif q and q.bid <= D(signal["stop_price"]):
+                outcome = 0
+            elif expiry and now >= expiry:
+                outcome = 0
+            if outcome is not None:
+                model.update(signal["features"], outcome)
+                await self.store.resolve_signal(signal["id"], outcome)
+                changed = True
+        if changed:
+            await self.store.save_model(model)
+
+    async def _risk_kill_check(self, config: PipConfig, snapshot: dict[str, float]) -> bool:
+        equity = max(0.0, snapshot["equity"])
+        daily = await self.store.daily_realized_pnl()
+        losses = await self.store.consecutive_losses()
+        peak = await self.store.peak_equity(config.paper_starting_equity)
+        drawdown = (peak - equity) / peak if peak > 0 else 0
+        daily_base = max(config.paper_starting_equity, peak)
+        reasons = []
+        if daily + snapshot["unrealized_pnl"] <= -(daily_base * config.max_daily_loss_pct):
+            reasons.append("daily loss limit")
+        if drawdown >= config.max_drawdown_pct:
+            reasons.append("drawdown limit")
+        if losses >= config.max_consecutive_losses:
+            reasons.append("consecutive loss limit")
+        if reasons:
+            config.agent_enabled = False
+            config.auto_trade = False
+            await self.store.save_config(config)
+            await self.store.event("kill_switch", "Pip paused: " + ", ".join(reasons), "error")
+            return True
+        return False
+
+    async def status(self) -> dict[str, Any]:
+        config = await self.store.load_config()
+        try:
+            snapshot = await self.equity_snapshot(config)
+        except Exception as exc:
+            snapshot = {
+                "equity": config.paper_starting_equity,
+                "cash": config.paper_starting_equity,
+                "exposure": 0.0,
+                "realized_pnl": await self.store.realized_pnl(),
+                "unrealized_pnl": 0.0,
+            }
+            self.last_scan_error = str(exc)
+        return {
+            **snapshot,
+            "daily_realized_pnl": await self.store.daily_realized_pnl(),
+            "agent_enabled": config.agent_enabled,
+            "auto_trade": config.auto_trade,
+            "mode": config.mode,
+            "scanning": self.scanning,
+            "last_scan_at": self.last_scan_at,
+            "last_scan_error": self.last_scan_error,
+            "kalshi_environment": self.kalshi.environment.name,
+            "kalshi_authenticated": self.kalshi.authenticated,
+            "config": config.to_public_dict(),
+            "model": json.loads((await self.store.load_model()).to_json()),
+        }
