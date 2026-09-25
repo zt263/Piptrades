@@ -41,6 +41,42 @@ class PipWebApp:
     async def api_status(self, request):
         return web.json_response(await self.engine.status())
 
+    async def api_account(self, request):
+        try:
+            return web.json_response(await self.engine.account_balance())
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=502)
+
+    async def api_live_entry(self, request):
+        body = await request.json()
+        if body.get("confirm") is not True:
+            return web.json_response({"error": "explicit confirmation required"}, status=400)
+        ticker = str(body.get("ticker") or "").strip()
+        side = str(body.get("side") or "").lower().strip()
+        if not ticker or side not in {"yes", "no"}:
+            return web.json_response({"error": "ticker and side are required"}, status=400)
+        try:
+            result = await self.engine.submit_reviewed_live_entry(ticker, side)
+            return web.json_response(result)
+        except Exception as exc:
+            await self.store.event("reviewed_live_entry_error", str(exc), "warning", {"ticker": ticker, "side": side})
+            return web.json_response({"error": str(exc)}, status=409)
+
+    async def api_live_exit(self, request):
+        body = await request.json()
+        if body.get("confirm") is not True:
+            return web.json_response({"error": "explicit confirmation required"}, status=400)
+        try:
+            position_id = int(body.get("position_id"))
+        except Exception:
+            return web.json_response({"error": "position_id is required"}, status=400)
+        try:
+            result = await self.engine.submit_reviewed_live_exit(position_id)
+            return web.json_response(result)
+        except Exception as exc:
+            await self.store.event("reviewed_live_exit_error", str(exc), "warning", {"position_id": position_id})
+            return web.json_response({"error": str(exc)}, status=409)
+
     async def api_settings_get(self, request):
         return web.json_response((await self.store.load_config()).to_public_dict())
 
@@ -116,6 +152,9 @@ class PipWebApp:
         app.router.add_get("/", self.index)
         app.router.add_get("/health", self.health)
         app.router.add_get("/api/status", self.api_status)
+        app.router.add_get("/api/account", self.api_account)
+        app.router.add_post("/api/live/entry", self.api_live_entry)
+        app.router.add_post("/api/live/exit", self.api_live_exit)
         app.router.add_get("/api/settings", self.api_settings_get)
         app.router.add_post("/api/settings", self.api_settings_post)
         app.router.add_get("/api/opportunities", self.api_opportunities)
