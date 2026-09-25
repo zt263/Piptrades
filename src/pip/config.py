@@ -28,6 +28,16 @@ class PipConfig:
     stop_loss_cents: int = 3
     max_hold_minutes: int = 60
 
+    # Late-close exploratory lane: reviewed-live only until calibrated.
+    late_close_enabled: bool = True
+    late_close_min_price: float = 0.90
+    late_close_max_price: float = 0.98
+    late_close_window_minutes: int = 360
+    late_close_target_cents: int = 1
+    late_close_stop_cents: int = 1
+    late_close_max_hold_minutes: int = 30
+    late_close_size_multiplier: float = 1.00
+
     min_volume_24h: float = 25.0
     max_spread_cents: int = 2
     shortlist_size: int = 30
@@ -70,6 +80,14 @@ class PipConfig:
         self.stop_loss_cents = max(1, min(int(self.stop_loss_cents), 25))
         self.max_hold_minutes = max(1, min(int(self.max_hold_minutes), 24 * 60))
         self.signal_horizon_minutes = max(5, min(int(self.signal_horizon_minutes), 24 * 60))
+
+        self.late_close_min_price = max(0.50, min(float(self.late_close_min_price), 0.98))
+        self.late_close_max_price = max(self.late_close_min_price, min(float(self.late_close_max_price), 0.99))
+        self.late_close_window_minutes = max(15, min(int(self.late_close_window_minutes), 24 * 60))
+        self.late_close_target_cents = max(1, min(int(self.late_close_target_cents), 5))
+        self.late_close_stop_cents = max(1, min(int(self.late_close_stop_cents), 10))
+        self.late_close_max_hold_minutes = max(5, min(int(self.late_close_max_hold_minutes), 180))
+        self.late_close_size_multiplier = max(0.10, min(float(self.late_close_size_multiplier), 1.0))
 
         self.min_volume_24h = max(0.0, float(self.min_volume_24h))
         self.max_spread_cents = max(1, min(int(self.max_spread_cents), 20))
@@ -127,6 +145,21 @@ class PipConfig:
         return min(200, max(self.shortlist_size, int(round(self.shortlist_size + (120 * self.activity_fraction)))))
 
     @property
+    def effective_late_close_window_minutes(self) -> int:
+        # Selective mode looks only very near close; max activity scans the full configured window.
+        floor = min(60, self.late_close_window_minutes)
+        return int(round(floor + ((self.late_close_window_minutes - floor) * self.activity_fraction)))
+
+    @property
+    def effective_late_close_max_spread_cents(self) -> int:
+        # Keep the late-stage lane tighter than the broad scanner.
+        return 1 if self.trade_activity < 60 else 2 if self.trade_activity < 90 else 3
+
+    @property
+    def effective_late_close_min_volume(self) -> float:
+        return max(1.0, self.effective_min_volume_24h * 0.5)
+
+    @property
     def max_new_trades_per_scan(self) -> int:
         # Relevant to paper/demo/autonomous modes only; reviewed live still needs a tap.
         return max(1, min(6, 1 + int(self.trade_activity / 20)))
@@ -150,6 +183,9 @@ class PipConfig:
             effective_min_volume_24h=self.effective_min_volume_24h,
             effective_shortlist_size=self.effective_shortlist_size,
             max_new_trades_per_scan=self.max_new_trades_per_scan,
+            effective_late_close_window_minutes=self.effective_late_close_window_minutes,
+            effective_late_close_max_spread_cents=self.effective_late_close_max_spread_cents,
+            effective_late_close_min_volume=self.effective_late_close_min_volume,
             live_execution_unlocked=self.live_execution_unlocked,
         )
         return data
@@ -163,7 +199,9 @@ class PipConfig:
             "max_hold_minutes", "min_volume_24h", "max_spread_cents",
             "shortlist_size", "scan_interval_seconds", "entry_style",
             "max_daily_loss_pct", "max_drawdown_pct", "max_consecutive_losses",
-            "signal_horizon_minutes",
+            "signal_horizon_minutes", "late_close_enabled", "late_close_min_price",
+            "late_close_max_price", "late_close_window_minutes", "late_close_target_cents",
+            "late_close_stop_cents", "late_close_max_hold_minutes", "late_close_size_multiplier",
         }
         for key, value in patch.items():
             if key in editable:

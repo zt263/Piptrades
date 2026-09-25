@@ -39,7 +39,7 @@
       <div class="box"><div class="label">Markets</div><div id="marketsCount" class="num">0</div></div>
       <div class="box"><div class="label">Books checked</div><div id="booksCount" class="num">0</div></div>
       <div class="box"><div class="label">Ranked</div><div id="rankedCount" class="num">0</div></div>
-      <div class="box"><div class="label">Eligible</div><div id="eligibleCount" class="num good">0</div></div>
+      <div class="box"><div class="label">Reviewable</div><div id="eligibleCount" class="num good">0</div></div>
     </div>
   </section>
 
@@ -189,7 +189,7 @@ function renderStatus(s){
   el('marketsCount').textContent=Number(stats.markets||0).toLocaleString();
   el('booksCount').textContent=Number(stats.orderbooks_received||0).toLocaleString();
   el('rankedCount').textContent=Number(stats.ranked||0).toLocaleString();
-  el('eligibleCount').textContent=Number(stats.eligible||0).toLocaleString();
+  el('eligibleCount').textContent=Number((stats.eligible||0)+(stats.late_close_reviewable||0)).toLocaleString();
 
   el('riskSlider').value=cfg.risk_level==null?100:cfg.risk_level;
   el('riskValue').textContent=String(cfg.risk_level==null?100:cfg.risk_level);
@@ -216,7 +216,8 @@ function renderStatus(s){
   if(stats.passed_prefilter!=null)scanBits.push(String(stats.passed_prefilter)+' passed gates');
   if(stats.depth_checked!=null)scanBits.push(String(stats.depth_checked)+' books requested');
   if(stats.ranked!=null)scanBits.push(String(stats.ranked)+' ranked');
-  if(stats.eligible!=null)scanBits.push(String(stats.eligible)+' eligible');
+  if(stats.eligible!=null)scanBits.push(String(stats.eligible)+' model-eligible');
+  if(stats.late_close_reviewable!=null)scanBits.push(String(stats.late_close_reviewable)+' late-close reviewable');
   el('scanMessage').textContent=scanBits.length?scanBits.join(' · '):'No completed scan yet.';
   el('runtimeError').textContent=s.last_scan_error||stats.orderbook_error||'';
   el('runtimeError').className=(s.last_scan_error||stats.orderbook_error)?'bad':'';
@@ -229,29 +230,56 @@ function isEligible(row){
          Number(row.expected_value)>0 &&
          Number(row.expected_value)>=Number(cfg.min_expected_value_dollars||0);
 }
+function isExploratory(row){
+  return String(row.strategy||'')==='late_close' && Boolean(row.reviewable_exploration);
+}
+function minutesLabel(row){
+  var n=Number(row.minutes_to_close);
+  if(!Number.isFinite(n))return '';
+  if(n<60)return Math.max(0,Math.round(n))+'m to close';
+  return (n/60).toFixed(1)+'h to close';
+}
 
 function renderOpportunities(rows){
   rows=rows||[];
   var eligible=rows.filter(isEligible).length;
-  el('opportunitySummary').textContent=rows.length+' ranked · '+eligible+' eligible';
+  var exploratory=rows.filter(isExploratory).length;
+  el('opportunitySummary').textContent=rows.length+' ranked · '+eligible+' model-eligible · '+exploratory+' late-close';
   el('opportunityEmpty').classList.toggle('hidden',rows.length>0);
-  el('opportunityRows').innerHTML=rows.slice(0,30).map(function(r){
+  el('opportunityRows').innerHTML=rows.slice(0,40).map(function(r){
     var eligibleNow=isEligible(r);
-    var canReview=eligibleNow&&state&&state.mode==='live'&&state.kalshi_authenticated&&state.agent_enabled;
-    var action=canReview?'<button class="primary smallbtn" data-ticker="'+safe(r.ticker)+'" data-side="'+safe(r.side)+'">Review</button>':(eligibleNow?'<span class="good">Eligible</span>':'<span class="fine">Watch</span>');
+    var exploratoryNow=isExploratory(r);
+    var reviewable=eligibleNow||exploratoryNow;
+    var canReview=reviewable&&state&&state.mode==='live'&&state.kalshi_authenticated&&state.agent_enabled;
+    var strategy=exploratoryNow?'Late close':'Scalp';
+    var detail=exploratoryNow
+      ? strategy+' · '+minutesLabel(r)+' · BE '+pct(r.break_even_probability||1)
+      : strategy;
+    var action=canReview
+      ? '<button class="primary smallbtn" data-ticker="'+safe(r.ticker)+'" data-side="'+safe(r.side)+'" data-strategy="'+safe(r.strategy||'scalp')+'">Review</button>'
+      : (reviewable?'<span class="good">Reviewable</span>':'<span class="fine">Watch</span>');
+    var evText=exploratoryNow
+      ? '<span class="fine">learning</span>'
+      : '<span class="'+pnlClass(r.expected_value)+'">'+money(r.expected_value)+'</span>';
     return '<tr>'+
-      '<td class="market">'+safe(r.title||r.ticker)+'<div class="fine">'+safe(r.ticker)+'</div></td>'+
+      '<td class="market">'+safe(r.title||r.ticker)+'<div class="fine">'+safe(r.ticker)+' · '+safe(detail)+'</div></td>'+
       '<td><span class="badge">'+safe(String(r.side||'').toUpperCase())+'</span></td>'+
       '<td>'+cents(r.entry_price)+'</td>'+
       '<td>'+cents(r.target_price)+'</td>'+
       '<td class="'+(eligibleNow?'good':'')+'">'+pct(r.probability)+'</td>'+
-      '<td class="'+pnlClass(r.expected_value)+'">'+money(r.expected_value)+'</td>'+
+      '<td>'+evText+'</td>'+
       '<td>'+safe(r.quantity)+'</td>'+
       '<td>'+action+'</td>'+
     '</tr>';
   }).join('');
   Array.from(el('opportunityRows').querySelectorAll('button[data-ticker]')).forEach(function(button){
-    button.addEventListener('click',function(){reviewEntry(button.getAttribute('data-ticker'),button.getAttribute('data-side'))});
+    button.addEventListener('click',function(){
+      reviewEntry(
+        button.getAttribute('data-ticker'),
+        button.getAttribute('data-side'),
+        button.getAttribute('data-strategy')
+      )
+    });
   });
 }
 
@@ -335,8 +363,11 @@ function queueSliderSave(){
   },350);
 }
 
-async function reviewEntry(ticker,side){
-  var question='Place a REAL '+String(side).toUpperCase()+' order in '+ticker+' using Pip current sizing and a fresh risk check?';
+async function reviewEntry(ticker,side,strategy){
+  var exploratory=String(strategy||'')==='late_close';
+  var question=exploratory
+    ? 'Place an EXPLORATORY REAL late-close '+String(side).toUpperCase()+' order in '+ticker+'? Pip will re-scan, re-check the hard risk cap, and use the late-close target/stop. This lane is still learning.'
+    : 'Place a REAL '+String(side).toUpperCase()+' order in '+ticker+' using Pip current sizing and a fresh risk check?';
   if(!confirm(question))return;
   try{
     var result=await api('/api/live/entry',{method:'POST',body:JSON.stringify({ticker:ticker,side:side,confirm:true})});

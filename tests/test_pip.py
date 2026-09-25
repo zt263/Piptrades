@@ -1,9 +1,10 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock
 
 from src.pip.config import PipConfig
-from src.pip.engine import quotes_for_market, refresh_quote_from_orderbook
+from src.pip.engine import PipEngine, SideQuote, quotes_for_market, refresh_quote_from_orderbook
 from src.pip.kalshi import PipKalshiClient
 from src.pip.math import (
     expected_value,
@@ -188,3 +189,73 @@ def test_get_order_uses_current_v2_portfolio_path():
         assert client.request.call_args.kwargs["auth"] is True
         await client.close()
     asyncio.run(run())
+
+
+def test_late_close_window_expands_with_activity_without_changing_risk():
+    low = PipConfig(trade_activity=0, risk_level=100).normalize()
+    high = PipConfig(trade_activity=100, risk_level=100).normalize()
+    assert low.effective_position_pct == high.effective_position_pct == 0.10
+    assert low.effective_late_close_window_minutes < high.effective_late_close_window_minutes
+    assert high.effective_late_close_window_minutes == high.late_close_window_minutes
+    assert high.effective_late_close_max_spread_cents == 3
+
+
+def test_late_close_micro_scalp_is_reviewable_but_not_forced_model_eligible():
+    cfg = PipConfig(
+        trade_activity=100,
+        risk_level=100,
+        late_close_enabled=True,
+        late_close_min_price=0.90,
+        late_close_max_price=0.98,
+    ).normalize()
+    engine = PipEngine(store=None, kalshi=None)
+    close = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+    q = SideQuote(
+        ticker="LATE",
+        title="Late close test",
+        side="yes",
+        bid=Decimal("0.96"),
+        ask=Decimal("0.97"),
+        bid_size=100,
+        ask_size=100,
+        volume_24h=500,
+        close_time=close,
+    )
+    book = {
+        "orderbook_fp": {
+            "yes_dollars": [["0.9600", "100.00"]],
+            "no_dollars": [["0.0300", "100.00"]],
+        }
+    }
+    opp = engine._build_opportunity(
+        q,
+        book,
+        cfg,
+        PipSignalModel(),
+        {"equity": 100.0, "cash": 100.0, "exposure": 0.0, "realized_pnl": 0.0, "unrealized_pnl": 0.0},
+    )
+    assert opp is not None
+    assert opp["strategy"] == "late_close"
+    assert opp["reviewable_exploration"] is True
+    assert Decimal(str(opp["target_price"])) - Decimal(str(opp["entry_price"])) == Decimal("0.01")
+    assert Decimal(str(opp["entry_price"])) - Decimal(str(opp["stop_price"])) == Decimal("0.01")
+    assert opp["quantity"] <= 10
+    assert opp["break_even_probability"] <= 0.80
+
+
+def test_99_cent_contract_is_not_late_close_micro_scalp():
+    cfg = PipConfig(trade_activity=100).normalize()
+    engine = PipEngine(store=None, kalshi=None)
+    close = (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat()
+    q = SideQuote(
+        ticker="NINETY-NINE",
+        title="No pre-settlement upside",
+        side="yes",
+        bid=Decimal("0.98"),
+        ask=Decimal("0.99"),
+        bid_size=100,
+        ask_size=100,
+        volume_24h=500,
+        close_time=close,
+    )
+    assert engine._is_late_close_quote(q, cfg) is False

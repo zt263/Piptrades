@@ -59,6 +59,13 @@ def parse_time(value: str | None) -> datetime | None:
         return None
 
 
+def minutes_until(value: str | None) -> float | None:
+    dt = parse_time(value)
+    if not dt:
+        return None
+    return (dt - datetime.now(timezone.utc)).total_seconds() / 60.0
+
+
 def price_field(market: dict[str, Any], name: str) -> Decimal:
     dollars = market.get(f"{name}_dollars")
     if dollars not in (None, ""):
@@ -318,7 +325,7 @@ class PipEngine:
                         prelim.append(q)
                     else:
                         rejected[reason] += 1
-                prelim.sort(key=lambda q: (float(q.spread), -q.volume_24h, -q.ask_size))
+                prelim.sort(key=lambda q: self._candidate_sort_key(q, config))
                 passed_prefilter = len(prelim)
                 prelim = prelim[: config.effective_shortlist_size]
 
@@ -368,6 +375,11 @@ class PipEngine:
                     and o["expected_value"] > 0
                     and o["expected_value"] >= config.min_expected_value_dollars
                 ]
+                exploratory = [
+                    o for o in opportunities
+                    if o.get("strategy") == "late_close"
+                    and bool(o.get("reviewable_exploration"))
+                ]
                 self.last_scan_stats = {
                     "markets": len(markets),
                     "quotes": len(quote_map),
@@ -378,6 +390,7 @@ class PipEngine:
                     "orderbook_error": orderbook_error,
                     "ranked": len(opportunities),
                     "eligible": len(eligible),
+                    "late_close_reviewable": len(exploratory),
                     "probability_pass": len(probability_pass),
                     "positive_ev": len(positive_ev),
                     "ev_pass": len(ev_pass),
@@ -393,6 +406,8 @@ class PipEngine:
                     "effective_shortlist_size": config.effective_shortlist_size,
                     "min_signal_probability": config.min_signal_probability,
                     "min_expected_value_dollars": config.min_expected_value_dollars,
+                    "late_close_window_minutes": config.effective_late_close_window_minutes,
+                    "late_close_max_spread_cents": config.effective_late_close_max_spread_cents,
                 }
 
                 expires = (datetime.now(timezone.utc) + timedelta(minutes=config.signal_horizon_minutes)).isoformat()
@@ -413,6 +428,31 @@ class PipEngine:
                 return opportunities
             finally:
                 self.scanning = False
+
+    def _is_late_close_quote(self, q: SideQuote, config: PipConfig) -> bool:
+        if not config.late_close_enabled:
+            return False
+        mins = minutes_until(q.close_time)
+        if mins is None or mins < 5 or mins > config.effective_late_close_window_minutes:
+            return False
+        if not (D(config.late_close_min_price) <= q.ask <= D(config.late_close_max_price)):
+            return False
+        if q.spread <= 0 or q.spread > D(config.effective_late_close_max_spread_cents) * CENT:
+            return False
+        if q.volume_24h < config.effective_late_close_min_volume:
+            return False
+        return True
+
+    def _candidate_sort_key(self, q: SideQuote, config: PipConfig):
+        late = self._is_late_close_quote(q, config)
+        mins = minutes_until(q.close_time)
+        return (
+            0 if late else 1,
+            float(q.spread),
+            mins if (late and mins is not None) else 10**9,
+            -q.volume_24h,
+            -q.ask_size,
+        )
 
     def _pre_filter_reason(self, q: SideQuote, config: PipConfig) -> str | None:
         if q.ask <= 0 or q.bid <= 0:
@@ -460,7 +500,16 @@ class PipEngine:
         near_depth = sum(support) + sum(opposing)
         liquidity = clamp(math.log10(near_depth + 1) / 2.5)
         volume = clamp(math.log10(q.volume_24h + 1) / 4.0)
-        price_extremity = clamp((float(q.ask) - config.effective_min_contract_price) / max(0.01, config.max_contract_price - config.effective_min_contract_price))
+        price_extremity = clamp(
+            (float(q.ask) - config.effective_min_contract_price)
+            / max(0.01, config.max_contract_price - config.effective_min_contract_price)
+        )
+        close_minutes = minutes_until(q.close_time)
+        late_close = self._is_late_close_quote(q, config)
+        time_proximity = 0.0
+        if close_minutes is not None and close_minutes > 0:
+            time_proximity = clamp(1.0 - (close_minutes / max(5.0, config.effective_late_close_window_minutes)))
+
         features = {
             "imbalance": imbalance,
             "momentum": momentum,
@@ -468,18 +517,40 @@ class PipEngine:
             "liquidity": liquidity,
             "volume": volume,
             "price_extremity": price_extremity,
+            "strategy": "late_close" if late_close else "scalp",
+            "minutes_to_close": close_minutes,
+            "time_proximity": time_proximity,
         }
         probability = model.predict(features)
 
-        intended, entry_is_maker = self._entry_price(q, config)
-        target = min(Decimal("0.99"), intended + D(config.take_profit_cents) * CENT)
-        stop = max(Decimal("0.01"), intended - D(config.stop_loss_cents) * CENT)
+        if late_close:
+            # Maker-first late-stage micro scalp: improve entry economics and seek +1c.
+            intended = min(q.ask - CENT, q.bid + CENT)
+            intended = max(Decimal("0.01"), min(Decimal("0.98"), intended))
+            entry_is_maker = True
+            target = min(Decimal("0.99"), intended + D(config.late_close_target_cents) * CENT)
+            stop = max(Decimal("0.01"), intended - D(config.late_close_stop_cents) * CENT)
+            max_hold = max(
+                1,
+                min(
+                    config.late_close_max_hold_minutes,
+                    int(max(1.0, (close_minutes or config.late_close_max_hold_minutes) - 2)),
+                ),
+            )
+        else:
+            intended, entry_is_maker = self._entry_price(q, config)
+            target = min(Decimal("0.99"), intended + D(config.take_profit_cents) * CENT)
+            stop = max(Decimal("0.01"), intended - D(config.stop_loss_cents) * CENT)
+            max_hold = config.max_hold_minutes
+
         count = max_contract_count(
             D(snapshot["equity"]), intended, config.effective_position_pct, config.effective_order_pct
         )
+        if late_close:
+            count = int(count * config.late_close_size_multiplier)
         if count < 1 or target <= intended:
             return None
-        # Thin books should shrink Pip, not make the whole candidate disappear.
+
         support_depth = int(sum(support)) if sum(support) > 0 else 0
         if support_depth > 0:
             count = min(count, support_depth)
@@ -487,15 +558,42 @@ class PipEngine:
             count = min(count, max(0, int(q.ask_size)))
         if count < 1:
             return None
+
         econ = trade_economics(
             count, intended, target, stop,
             entry_is_maker=entry_is_maker,
             target_exit_is_maker=False,
         )
+        if econ.net_win <= 0:
+            return None
+
         ev = expected_value(probability, econ)
         fill_factor = 0.70 if entry_is_maker else 1.0
-        velocity = max(0.1, float(ev)) * fill_factor / max(5.0, config.signal_horizon_minutes)
-        score = (probability * 100.0) + (float(ev) * 35.0) + (velocity * 1000.0) + (imbalance * 4.0)
+        horizon = max(5.0, min(float(config.signal_horizon_minutes), float(max_hold)))
+        velocity = max(0.0, float(ev)) * fill_factor / horizon
+
+        reviewable_exploration = (
+            late_close
+            and econ.break_even_probability <= 0.80
+            and close_minutes is not None
+            and close_minutes >= 5
+        )
+        features.update({
+            "reviewable_exploration": reviewable_exploration,
+            "break_even_probability": econ.break_even_probability,
+            "max_hold_minutes": max_hold,
+            "net_win_if_target": float(econ.net_win),
+            "net_loss_if_stop": float(econ.net_loss),
+        })
+
+        late_bonus = (time_proximity * 8.0) + (2.0 if reviewable_exploration else 0.0)
+        score = (
+            (probability * 100.0)
+            + (float(ev) * 35.0)
+            + (velocity * 1000.0)
+            + (imbalance * 4.0)
+            + late_bonus
+        )
         return {
             "ticker": q.ticker,
             "title": q.title,
@@ -513,6 +611,10 @@ class PipEngine:
             "break_even_probability": econ.break_even_probability,
             "entry_is_maker": entry_is_maker,
             "entry_fee_estimate": float(econ.entry_fee),
+            "strategy": "late_close" if late_close else "scalp",
+            "reviewable_exploration": reviewable_exploration,
+            "minutes_to_close": close_minutes,
+            "max_hold_minutes": max_hold,
         }
 
     def _entry_price(self, q: SideQuote, config: PipConfig) -> tuple[Decimal, bool]:
@@ -566,6 +668,8 @@ class PipEngine:
         rationale = json.dumps({
             "probability": opp["probability"],
             "expected_value": opp["expected_value"],
+            "strategy": opp.get("strategy", "scalp"),
+            "reviewable_exploration": opp.get("reviewable_exploration", False),
             "features": opp["features"],
         })
         if config.mode == "paper":
@@ -585,7 +689,7 @@ class PipEngine:
                 "intended_entry": opp["entry_price"], "entry_price": entry_price,
                 "entry_fee": entry_fee, "target_price": opp["target_price"],
                 "stop_price": opp["stop_price"], "opened_at": opened_at,
-                "max_hold_minutes": config.max_hold_minutes, "last_bid": None,
+                "max_hold_minutes": int(opp.get("max_hold_minutes", config.max_hold_minutes)), "last_bid": None,
                 "rationale": rationale,
             })
             if pid:
@@ -642,7 +746,7 @@ class PipEngine:
             "entry_fee": float(fill_summary["total_fee"]),
             "target_price": opp["target_price"], "stop_price": opp["stop_price"],
             "opened_at": utcnow() if actual_qty > 0 else None,
-            "max_hold_minutes": config.max_hold_minutes, "entry_order_id": order_id,
+            "max_hold_minutes": int(opp.get("max_hold_minutes", config.max_hold_minutes)), "entry_order_id": order_id,
             "rationale": rationale,
         })
         if pid:
@@ -699,10 +803,22 @@ class PipEngine:
             raise PipKalshiError("Maximum open positions reached")
         if any(p["ticker"] == ticker and p["side"] == side for p in positions):
             raise PipKalshiError("Pip already has an active position/order in this market and side")
-        if opp["probability"] < config.min_signal_probability:
-            raise PipKalshiError("Signal fell below the current approval threshold")
-        if opp["expected_value"] <= 0 or opp["expected_value"] < config.min_expected_value_dollars:
-            raise PipKalshiError("Expected value fell below the current approval threshold")
+        exploratory_late_close = (
+            opp.get("strategy") == "late_close"
+            and bool(opp.get("reviewable_exploration"))
+        )
+        if not exploratory_late_close:
+            if opp["probability"] < config.min_signal_probability:
+                raise PipKalshiError("Signal fell below the current approval threshold")
+            if opp["expected_value"] <= 0 or opp["expected_value"] < config.min_expected_value_dollars:
+                raise PipKalshiError("Expected value fell below the current approval threshold")
+        else:
+            # Exploratory lane is explicitly reviewed by the operator and must remain
+            # structurally bounded even while the model is still calibrating.
+            if opp.get("minutes_to_close") is None or float(opp["minutes_to_close"]) < 5:
+                raise PipKalshiError("Late-close market is too close to closing")
+            if float(opp.get("break_even_probability", 1)) > 0.80:
+                raise PipKalshiError("Late-close trade economics are too weak")
 
         equity = max(0.01, snapshot["equity"])
         position_notional = float(opp["entry_price"]) * int(opp["quantity"])

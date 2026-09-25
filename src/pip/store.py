@@ -226,6 +226,13 @@ class PipStore:
             for row in await cur.fetchall():
                 d = dict(row)
                 d["features"] = json.loads(d.pop("features_json"))
+                for key in (
+                    "strategy", "reviewable_exploration", "minutes_to_close",
+                    "break_even_probability", "max_hold_minutes",
+                    "net_win_if_target", "net_loss_if_stop",
+                ):
+                    if key in d["features"]:
+                        d[key] = d["features"][key]
                 out.append(d)
             return out
 
