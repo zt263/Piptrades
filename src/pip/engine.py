@@ -375,6 +375,11 @@ class PipEngine:
                     and o["expected_value"] > 0
                     and o["expected_value"] >= config.min_expected_value_dollars
                 ]
+                exploratory = [
+                    o for o in opportunities
+                    if o.get("strategy") == "late_close"
+                    and bool(o.get("reviewable_exploration"))
+                ]
                 self.last_scan_stats = {
                     "markets": len(markets),
                     "quotes": len(quote_map),
@@ -385,6 +390,7 @@ class PipEngine:
                     "orderbook_error": orderbook_error,
                     "ranked": len(opportunities),
                     "eligible": len(eligible),
+                    "late_close_reviewable": len(exploratory),
                     "probability_pass": len(probability_pass),
                     "positive_ev": len(positive_ev),
                     "ev_pass": len(ev_pass),
@@ -400,6 +406,8 @@ class PipEngine:
                     "effective_shortlist_size": config.effective_shortlist_size,
                     "min_signal_probability": config.min_signal_probability,
                     "min_expected_value_dollars": config.min_expected_value_dollars,
+                    "late_close_window_minutes": config.effective_late_close_window_minutes,
+                    "late_close_max_spread_cents": config.effective_late_close_max_spread_cents,
                 }
 
                 expires = (datetime.now(timezone.utc) + timedelta(minutes=config.signal_horizon_minutes)).isoformat()
