@@ -153,6 +153,7 @@ class PipEngine:
         self.history: dict[tuple[str, str], deque[tuple[float, Decimal]]] = defaultdict(lambda: deque(maxlen=12))
         self.last_scan_at: str | None = None
         self.last_scan_error: str | None = None
+        self.last_scan_stats: dict[str, Any] = {}
         self.scanning = False
         self._loop_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
@@ -272,11 +273,16 @@ class PipEngine:
                 killed = await self._risk_kill_check(config, snapshot)
 
                 prelim = []
+                rejected = defaultdict(int)
                 for q in quote_map.values():
-                    if self._pre_filter(q, config):
+                    reason = self._pre_filter_reason(q, config)
+                    if reason is None:
                         prelim.append(q)
+                    else:
+                        rejected[reason] += 1
                 prelim.sort(key=lambda q: (float(q.spread), -q.volume_24h, -q.ask_size))
-                prelim = prelim[: config.shortlist_size]
+                passed_prefilter = len(prelim)
+                prelim = prelim[: config.effective_shortlist_size]
 
                 books: dict[str, dict[str, Any]] = {}
                 opportunities = []
@@ -292,6 +298,28 @@ class PipEngine:
 
                 opportunities.sort(key=lambda x: x["score"], reverse=True)
                 await self.store.replace_opportunities(opportunities)
+                eligible = [
+                    o for o in opportunities
+                    if o["probability"] >= config.min_signal_probability
+                    and o["expected_value"] > 0
+                    and o["expected_value"] >= config.min_expected_value_dollars
+                ]
+                self.last_scan_stats = {
+                    "markets": len(markets),
+                    "quotes": len(quote_map),
+                    "passed_prefilter": passed_prefilter,
+                    "shortlisted": len(prelim),
+                    "ranked": len(opportunities),
+                    "eligible": len(eligible),
+                    "rejected": dict(rejected),
+                    "activity": config.trade_activity,
+                    "effective_min_contract_price": config.effective_min_contract_price,
+                    "effective_max_spread_cents": config.effective_max_spread_cents,
+                    "effective_min_volume_24h": config.effective_min_volume_24h,
+                    "effective_shortlist_size": config.effective_shortlist_size,
+                    "min_signal_probability": config.min_signal_probability,
+                    "min_expected_value_dollars": config.min_expected_value_dollars,
+                }
 
                 expires = (datetime.now(timezone.utc) + timedelta(minutes=config.signal_horizon_minutes)).isoformat()
                 for opp in opportunities[: min(15, len(opportunities))]:
@@ -304,31 +332,34 @@ class PipEngine:
                 self.last_scan_error = None
                 await self.store.event(
                     "scan",
-                    f"Scanned {len(markets)} markets; {len(opportunities)} Pip opportunities",
-                    payload={"markets": len(markets), "opportunities": len(opportunities)},
+                    f"Scanned {len(markets)} markets; {len(opportunities)} ranked; {len(eligible)} eligible",
+                    payload=self.last_scan_stats,
                 )
                 return opportunities
             finally:
                 self.scanning = False
 
-    def _pre_filter(self, q: SideQuote, config: PipConfig) -> bool:
+    def _pre_filter_reason(self, q: SideQuote, config: PipConfig) -> str | None:
         if q.ask <= 0 or q.bid <= 0:
-            return False
-        if not (D(config.min_contract_price) <= q.ask <= D(config.max_contract_price)):
-            return False
-        if q.spread <= 0 or q.spread > D(config.max_spread_cents) * CENT:
-            return False
-        if q.volume_24h < config.min_volume_24h:
-            return False
+            return "no_quote"
+        if not (D(config.effective_min_contract_price) <= q.ask <= D(config.max_contract_price)):
+            return "price"
+        if q.spread <= 0 or q.spread > D(config.effective_max_spread_cents) * CENT:
+            return "spread"
+        if q.volume_24h < config.effective_min_volume_24h:
+            return "volume"
         if q.ask >= Decimal("1"):
-            return False
+            return "settled_price"
         if q.close_time:
             close = parse_time(q.close_time)
             if close and close <= datetime.now(timezone.utc) + timedelta(minutes=5):
-                return False
+                return "closing"
         if q.ticker.startswith("KXMVE"):
-            return False
-        return True
+            return "excluded_series"
+        return None
+
+    def _pre_filter(self, q: SideQuote, config: PipConfig) -> bool:
+        return self._pre_filter_reason(q, config) is None
 
     def _momentum(self, q: SideQuote) -> float:
         hist = self.history[(q.ticker, q.side)]
@@ -350,11 +381,11 @@ class PipEngine:
         imbalance = book_imbalance(support, opposing)
         momentum = self._momentum(q)
         spread_cents = float(q.spread / CENT)
-        spread_quality = clamp(1.0 - (spread_cents / max(1.0, config.max_spread_cents)))
+        spread_quality = clamp(1.0 - (spread_cents / max(1.0, config.effective_max_spread_cents)))
         near_depth = sum(support) + sum(opposing)
         liquidity = clamp(math.log10(near_depth + 1) / 2.5)
         volume = clamp(math.log10(q.volume_24h + 1) / 4.0)
-        price_extremity = clamp((float(q.ask) - config.min_contract_price) / max(0.01, config.max_contract_price - config.min_contract_price))
+        price_extremity = clamp((float(q.ask) - config.effective_min_contract_price) / max(0.01, config.max_contract_price - config.effective_min_contract_price))
         features = {
             "imbalance": imbalance,
             "momentum": momentum,
@@ -373,9 +404,13 @@ class PipEngine:
         )
         if count < 1 or target <= intended:
             return None
-        if sum(support) > 0 and sum(support) < count:
-            return None
-        if not entry_is_maker and q.ask_size > 0 and q.ask_size < count:
+        # Thin books should shrink Pip, not make the whole candidate disappear.
+        support_depth = int(sum(support)) if sum(support) > 0 else 0
+        if support_depth > 0:
+            count = min(count, support_depth)
+        if not entry_is_maker and q.ask_size > 0:
+            count = min(count, max(0, int(q.ask_size)))
+        if count < 1:
             return None
         econ = trade_economics(
             count, intended, target, stop,
@@ -424,7 +459,7 @@ class PipEngine:
         )
         max_exposure = equity * config.max_total_exposure_pct
         cash_floor = equity * config.min_cash_reserve_pct
-        max_new = max(1, 1 + config.trade_activity // 25)
+        max_new = config.max_new_trades_per_scan
         entered = 0
 
         for opp in opportunities:
@@ -874,6 +909,7 @@ class PipEngine:
             "scanning": self.scanning,
             "last_scan_at": self.last_scan_at,
             "last_scan_error": self.last_scan_error,
+            "scan_stats": self.last_scan_stats,
             "kalshi_environment": self.kalshi.environment.name,
             "kalshi_authenticated": self.kalshi.authenticated,
             "config": config.to_public_dict(),
