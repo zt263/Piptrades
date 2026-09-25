@@ -353,6 +353,15 @@ class PipEngine:
 
                 opportunities.sort(key=lambda x: x["score"], reverse=True)
                 await self.store.replace_opportunities(opportunities)
+                probability_pass = [
+                    o for o in opportunities
+                    if o["probability"] >= config.min_signal_probability
+                ]
+                positive_ev = [o for o in opportunities if o["expected_value"] > 0]
+                ev_pass = [
+                    o for o in opportunities
+                    if o["expected_value"] >= config.min_expected_value_dollars
+                ]
                 eligible = [
                     o for o in opportunities
                     if o["probability"] >= config.min_signal_probability
@@ -369,6 +378,13 @@ class PipEngine:
                     "orderbook_error": orderbook_error,
                     "ranked": len(opportunities),
                     "eligible": len(eligible),
+                    "probability_pass": len(probability_pass),
+                    "positive_ev": len(positive_ev),
+                    "ev_pass": len(ev_pass),
+                    "max_probability": max((o["probability"] for o in opportunities), default=0),
+                    "max_expected_value": max((o["expected_value"] for o in opportunities), default=0),
+                    "top_break_even_probability": min((o["break_even_probability"] for o in opportunities), default=1),
+                    "model_observations": model.observations,
                     "rejected": dict(rejected),
                     "activity": config.trade_activity,
                     "effective_min_contract_price": config.effective_min_contract_price,
