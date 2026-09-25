@@ -351,6 +351,56 @@ class PipStore:
             await db.commit()
         return pnl
 
+    async def record_partial_exit(
+        self,
+        position: dict[str, Any],
+        *,
+        filled_quantity: int,
+        exit_price: float,
+        exit_fee: float,
+        exit_reason: str,
+    ) -> float:
+        total_qty = int(position["quantity"])
+        filled = max(0, min(int(filled_quantity), total_qty))
+        if filled <= 0:
+            return 0.0
+        if filled >= total_qty:
+            return await self.close_position(
+                position,
+                exit_price=exit_price,
+                exit_fee=exit_fee,
+                exit_reason=exit_reason,
+            )
+
+        entry = float(position["entry_price"])
+        total_entry_fee = float(position.get("entry_fee") or 0)
+        entry_fee_share = total_entry_fee * (filled / total_qty)
+        remaining_entry_fee = max(0.0, total_entry_fee - entry_fee_share)
+        pnl = ((float(exit_price) - entry) * filled) - entry_fee_share - float(exit_fee)
+        remaining_qty = total_qty - filled
+
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE pip_positions SET quantity=?, entry_fee=?, status='open', exit_order_id=NULL, last_bid=? WHERE id=?",
+                (remaining_qty, remaining_entry_fee, exit_price, position["id"]),
+            )
+            await db.execute(
+                """
+                INSERT INTO pip_trades(
+                  ticker,side,mode,quantity,entry_price,exit_price,entry_fee,exit_fee,pnl,
+                  opened_at,closed_at,exit_reason,rationale
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    position["ticker"], position["side"], position["mode"], filled, entry, exit_price,
+                    entry_fee_share, float(exit_fee), pnl,
+                    position["opened_at"] or position["created_at"], utcnow(),
+                    exit_reason + "_partial", position.get("rationale"),
+                ),
+            )
+            await db.commit()
+        return pnl
+
     async def trades(self, limit: int = 100) -> list[dict[str, Any]]:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
